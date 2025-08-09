@@ -2,9 +2,10 @@
 $urls = @(
     "https://aka.ms/vs/17/release/vc_redist.x86.exe",
     "https://aka.ms/vs/17/release/vc_redist.x64.exe"
-#	"https://aka.ms/vs/17/release/vc_redist.arm64.exe" # Uncomment if using Arm64 device
-
 )
+if ($env:PROCESSOR_ARCHITECTURE -eq 'ARM64') {
+    $urls += "https://aka.ms/vs/17/release/vc_redist.arm64.exe"
+}
 
 # Directory to save the downloads
 $downloadPath = "$env:TEMP"
