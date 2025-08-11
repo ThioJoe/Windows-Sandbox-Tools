@@ -9,7 +9,8 @@ PowerShell scripts that can install apps or components not normally included in 
 - `Install-Microsoft-Store.ps1`: Installs the Microsoft Store via the Windows Update APIs
   - Unlike other similar scripts, mine does NOT use any third party APIs like UUP Dump or RG-Adguard at all
   - (All web requests go directly to Microsoft servers. Even those fetching the download URLs in the first place)
-- `Install VC Redist.ps1`: Installs the latest Microsoft Visual C++ Redistributables, which are commonly required by other software.
+- `Install VC Redist.ps1`: Installs each architecture for [the latest Microsoft Visual C++ Redistributable](https://learn.microsoft.com/en-us/cpp/windows/latest-supported-vc-redist?view=msvc-170#latest-microsoft-visual-c-redistributable-version) (2015-2022), which is commonly required by other software.
+  - `Install VC Redist AIO.ps1`: An alternative script that installs every Visual C++ Redistributable via [VisualCppRedist AIO Pack](https://github.com/abbodi1406/vcredist) by abbodi1406. Recommended if you're frequently running older programs.
 
 ## 🛠️ General Scripts
 
