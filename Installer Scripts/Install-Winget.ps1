@@ -81,6 +81,7 @@ function Install-WingetDependencies {
 $ProgressPreference = 'SilentlyContinue'
 
 $downloadPath = Join-Path $env:USERPROFILE "Downloads"
+if (!(Test-Path $downloadPath)) { New-Item -ItemType Directory -Path $downloadPath }
 $latestRelease = Get-LatestRelease
 if (-not $latestRelease) { Write-Error "Could not retrieve the latest release. Exiting."; return; }
 
@@ -125,8 +126,10 @@ if ($depsZipUrl) {
 
     # Remove existing Dependencies folder and expand the zip
     if (Test-Path $topDepsFolder) { Remove-Item -Path $topDepsFolder -Recurse -Force }
-   
-    Expand-Archive -LiteralPath $depsZipPath -DestinationPath $topDepsFolder -Force
+
+    # Replaces Expand archives with .NET System.IO.Compression
+    Add-Type -AssemblyName System.IO.Compression.FileSystem
+    [System.IO.Compression.ZipFile]::ExtractToDirectory($depsZipPath, $topDepsFolder)
 } 
 else { Write-Warning "No $depsZipName found in $latestTag, skipping dependency download."; }
 
@@ -156,4 +159,3 @@ if ($removeMsStoreAsSource.IsPresent) {
     # Automatically accept source agreements to avoid prompts. Mostly applies to msstore.
     winget list --accept-source-agreements | Out-Null
 }
-
