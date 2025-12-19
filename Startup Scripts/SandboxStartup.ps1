@@ -32,6 +32,9 @@ CiTool.exe --refresh --json | Out-Null # Refreshes policy. Use json output param
 # Change execution policy for powershell to allow running scripts. Normally it shows an error about a more specific policy (Process level Bypass policy), but it doesn't matter so we hide it via try/catch
 try { Set-ExecutionPolicy -ExecutionPolicy Unrestricted -Scope LocalMachine -ErrorAction Stop | Out-Null } catch {}
 
+# Enable Clipboard History
+Set-ItemProperty -Path "HKCU:\Software\Microsoft\Clipboard" -Name "EnableClipboardHistory" -Value 1 -Type DWord -Force
+
 # -----------------------------------------------------------------------------------------
 
 # ---- Add 'Open PowerShell Here' and 'Open CMD Here' to context menu -------

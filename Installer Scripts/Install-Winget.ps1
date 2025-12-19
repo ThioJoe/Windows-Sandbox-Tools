@@ -22,7 +22,7 @@ function Get-LatestRelease {
         return $null
     }
 
-	if (-not $releases) { Write-Error "No releases found for $repoOwner/$repoName."; return $null; }
+    if (-not $releases) { Write-Error "No releases found for $repoOwner/$repoName."; return $null; }
 
     # Pick the top entry once sorted by published_at descending
     $latestRelease = $releases | Sort-Object -Property published_at -Descending | Select-Object -First 1
@@ -125,8 +125,17 @@ if ($depsZipUrl) {
 
     # Remove existing Dependencies folder and expand the zip
     if (Test-Path $topDepsFolder) { Remove-Item -Path $topDepsFolder -Recurse -Force }
-   
-    Expand-Archive -LiteralPath $depsZipPath -DestinationPath $topDepsFolder -Force
+    
+    # Use Expand-Archive cmdlet by default because it's safe for constrained language mode. Fall back to .NET assembly if it fails.
+    try {
+        Expand-Archive -LiteralPath $depsZipPath -DestinationPath $topDepsFolder -Force -ErrorAction Stop
+    }
+    catch {
+        Write-Warning "Standard extraction failed, attempting .NET fallback. The error was: $($_.Exception.Message)"
+        # Fallback using .NET System.IO.Compression (Fixes issues in non-EN Windows Sandbox)
+        Add-Type -AssemblyName System.IO.Compression.FileSystem
+        [System.IO.Compression.ZipFile]::ExtractToDirectory($depsZipPath, $topDepsFolder)
+    }
 } 
 else { Write-Warning "No $depsZipName found in $latestTag, skipping dependency download."; }
 
@@ -156,4 +165,3 @@ if ($removeMsStoreAsSource.IsPresent) {
     # Automatically accept source agreements to avoid prompts. Mostly applies to msstore.
     winget list --accept-source-agreements | Out-Null
 }
-
