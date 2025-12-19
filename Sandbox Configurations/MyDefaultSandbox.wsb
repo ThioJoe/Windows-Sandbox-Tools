@@ -28,9 +28,12 @@
 	<!-- Run the powershell script from the mapped folder -->
 	<LogonCommand>
 		<!-- The seemingly redundant command nesting makes it so the powershell window is visible when running. -->
-		<Command>powershell -executionpolicy Bypass -command "start powershell {-file C:\Users\WDAGUtilityAccount\Desktop\HostShared\SandboxStartup.ps1 -launchingSandbox}"</Command>
+		<Command>powershell -executionpolicy Bypass -command "start powershell {-file C:\Users\WDAGUtilityAccount\Desktop\HostShared\Windows-Sandbox-Tools\General Scripts\SandboxStartup.ps1 -launchingSandbox}"</Command>
 		<!-- Note: You can add more powershell commands in additional blocks. For example you can uncomment the line below. -->
-		<!-- <Command>powershell -executionpolicy Bypass -command "start powershell {-file \"C:\Users\WDAGUtilityAccount\Desktop\HostShared\Set Theme Dark Mode.ps1\"}"</Command> -->
+		<!-- <Command>powershell -executionpolicy Bypass -command "start powershell {-file \"C:\Users\WDAGUtilityAccount\Desktop\HostShared\Windows-Sandbox-Tools\General Scripts\Set Theme Dark Mode.ps1\"}"</Command> -->
+		<!-- <Command>powershell -executionpolicy Bypass -command "start powershell {-file \"C:\Users\WDAGUtilityAccount\Desktop\HostShared\Windows-Sandbox-Tools\Installer Scripts\Install VC Redist.ps1\"}"</Command> -->
+		<!-- <Command>powershell -executionpolicy Bypass -command "start powershell {-file \"C:\Users\WDAGUtilityAccount\Desktop\HostShared\Windows-Sandbox-Tools\Installer Scripts\Install-Microsoft-Store.ps1\"}"</Command> -->
+		<!-- <Command>powershell -executionpolicy Bypass -command "start powershell {-file \"C:\Users\WDAGUtilityAccount\Desktop\HostShared\Windows-Sandbox-Tools\Installer Scripts\Install-Winget.ps1\"}"</Command> -->
 	</LogonCommand>
 
 </Configuration> 
