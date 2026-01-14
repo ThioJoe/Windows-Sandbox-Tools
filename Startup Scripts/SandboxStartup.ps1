@@ -25,7 +25,11 @@ reg add "HKCU\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced" /v "H
 # Show hidden files
 reg add "HKCU\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced" /v "Hidden" /t REG_DWORD /d 1 /f
 
-# Fix for slow MSI package install. See: https://github.com/microsoft/Windows-Sandbox/issues/68#issuecomment-2754867968
+# Enable Windows Long Path support
+reg add "HKEY_LOCAL_MACHINE\SYSTEM\CurrentControlSet\Control\FileSystem" /v "LongPathsEnabled" /t REG_DWORD /d 1 /f
+
+# Fix for slow MSI package install. Note: On a normal machine this would disable "Smart App Control", it's unknown the exact effect within the sandbox. It likely disables some kind of SmartScreen security checking.
+# See: https://github.com/microsoft/Windows-Sandbox/issues/68#issuecomment-2754867968
 reg add "HKLM\SYSTEM\CurrentControlSet\Control\CI\Policy" /v "VerifiedAndReputablePolicyState" /t REG_DWORD /d 0 /f
 CiTool.exe --refresh --json | Out-Null # Refreshes policy. Use json output param or else it will prompt for confirmation, even with Out-Null
 
