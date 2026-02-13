@@ -78,9 +78,9 @@ reg add "HKEY_CLASSES_ROOT\.ps1\ShellNew" /v "ItemName" /t REG_SZ /d "script" /f
 
 # NotePad Tip: Go to C:\Windows on your main computer and copy Notepad.exe, then copy notepad.exe.mui from your main language folder, such as C:\Windows\en-US
 #    Important: Notepad.exe.mui can't simply go next to notepad.exe. You need to actually create the language folder (like en-US) again next to notepad.exe and put it in that. Otherwise notepad won't run.
-$notepadPath = "C:\Users\WDAGUtilityAccount\Desktop\HostShared\notepad.exe"
+$notepadPath = "C:\Users\WDAGUtilityAccount\Desktop\HostShared\Apps\notepad.exe"
 # For Notepad++, use the portable version
-$notepadPlusPlusPath = "C:\Users\WDAGUtilityAccount\Desktop\HostShared\Notepad++\Notepad++.exe"
+$notepadPlusPlusPath = "C:\Users\WDAGUtilityAccount\Desktop\HostShared\Apps\Notepad++\Notepad++.exe"
 
 # Check if the Notepad and Notepad++ paths exist, if not, set them to null
 If (!(Test-Path $notepadPath)) { $notepadPath = $null; Write-Host "Notepad not found, context menu options will not be added." }

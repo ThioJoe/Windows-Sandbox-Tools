@@ -4,16 +4,39 @@
 
 # Author: ThioJoe
 # Repo Url: https://github.com/ThioJoe/Windows-Sandbox-Tools
-# Last Updated: August 10, 2025
+# Last Updated: February 12, 2026
 
 param(
     # Optional switch to output the generated XML files to the working directory
     [switch]$debugSaveFiles,
+    
     # Optional switch to skip the installation of Microsoft Store, but still download the files
     [switch]$noInstall,
+
     # Optional switch to skip the download and install, but still show the packages found 
-    [switch]$noDownload
+    [switch]$noDownload,
+
+    # Optional path to a local directory containing the installation files. If provided, the download steps will be skipped.
+    #   - Just copy the entire "MSStore Install" folder with the files the script normally downloads, and put it in your mounted folder to avoid having to re-download it.
+    #        - You can find the "MSStore Install" folder in the "Downloads" folder.
+    #   - Make sure to use the mounted path from the perspective of within the sandbox.
+    [string]$ExistingInstallerFilesPath
 )
+
+# --- Parameter Usage Examples ---
+# Standard run (Download & Install):
+#    .\Install-Microsoft-Store.ps1
+#
+# Install from existing files instead of downloading:
+#    .\Install-Microsoft-Store.ps1 -ExistingInstallerFilesPath "C:\Users\WDAGUtilityAccount\Desktop\HostShared\MSStore Install"
+#
+# Download only (Don't Install):
+#    .\Install-Microsoft-Store.ps1 -noInstall
+#
+# Debug mode (Save SOAP XML logs to disk):
+#    .\Install-Microsoft-Store.ps1 -debugSaveFiles
+
+# =======================================================
 
 # --- Configuration ---
 # Note: These defaults should work for the regular current build of Microsoft Store, but I haven't tested using any of the other values. So fetching insider builds of MS Store (if any) might not work.
@@ -43,21 +66,26 @@ $subfolderName = "MSStore Install"
 # Category ID for the Microsoft Store app package
 $storeCategoryId = "64293252-5926-453c-9494-2d4021f1c78d" 
 
-# Combine them to create the full working directory path
-$workingDir = Join-Path -Path $userDownloadsFolder -ChildPath $subfolderName
-$LogDirectory = Join-Path -Path $workingDir -ChildPath "Logs"
-
-# Create the directory if it doesn't exist
-if (-not (Test-Path -Path $workingDir)) {
-    New-Item -Path $workingDir -ItemType Directory -Force | Out-Null
+if ($ExistingInstallerFilesPath) {
+    if (Test-Path -Path $ExistingInstallerFilesPath) {
+        $workingDir = $ExistingInstallerFilesPath
+        Write-Host "Using local source path: $workingDir" -ForegroundColor Yellow
+    } else {
+        Write-Error "The specified local source path does not exist: $ExistingInstallerFilesPath"
+        return
+    }
+} else {
+    # Combine them to create the full working directory path
+    $workingDir = Join-Path -Path $userDownloadsFolder -ChildPath $subfolderName
+    
+    # Create the directory if it doesn't exist
+    if (-not (Test-Path -Path $workingDir)) {
+        New-Item -Path $workingDir -ItemType Directory -Force | Out-Null
+    }
 }
 
 If ($debugSaveFiles) {
-    # Create a subdirectory for logs if it doesn't exist
-    if (-not (Test-Path -Path $LogDirectory)) {
-        New-Item -Path $LogDirectory -ItemType Directory -Force | Out-Null
-    }
-    Write-Host "All files (logs, downloads) will be saved to: '$LogDirectory'" -ForegroundColor Yellow
+    Write-Host "All files (logs, downloads) will be saved to: '$workingDir'" -ForegroundColor Yellow
 }
 
 # --- XML Templates ---
@@ -185,204 +213,206 @@ $headers = @{ "Content-Type" = "application/soap+xml; charset=utf-8" }
 $baseUri = "https://fe3.delivery.mp.microsoft.com/ClientWebService/client.asmx"
 
 try {
-    # Step 1: Get Cookie
-    Write-Host "Step 1: Getting authentication cookie..."
-    $cookieRequestPayload = $cookieXmlTemplate
-    If ($debugSaveFiles) { $cookieRequestPayload | Set-Content -Path (Join-Path $LogDirectory "01_Step1_Request.xml") }
-    
-    $cookieResponse = Invoke-WebRequest -Uri $baseUri -Method Post -Body $cookieRequestPayload -Headers $headers -UseBasicParsing
-    If ($debugSaveFiles) { $cookieResponse.Content | Set-Content -Path (Join-Path $LogDirectory "01_Step1_Response.xml"); Write-Host "  -> Saved request and response logs for Step 1." }
-
-    $cookieResponseXml = [xml]$cookieResponse.Content
-    $encryptedCookieData = $cookieResponseXml.Envelope.Body.GetCookieResponse.GetCookieResult.EncryptedData
-    Write-Host "Success. Cookie received." -ForegroundColor Green
-
-    # Step 2: Get File List
-    Write-Host "Step 2: Getting file list..."
-    $fileListRequestPayload = $fileListXmlTemplate -f $encryptedCookieData, $storeCategoryId, $currentBranch, $flightRing, $flightingBranchName
-    If ($debugSaveFiles) { [System.IO.File]::WriteAllText((Join-Path $LogDirectory "02_Step2_Request_AUTOMATED.xml"), $fileListRequestPayload, [System.Text.UTF8Encoding]::new($false)) }
-
-    $fileListResponse = Invoke-WebRequest -Uri $baseUri -Method Post -Body $fileListRequestPayload -Headers $headers -UseBasicParsing
-    If ($debugSaveFiles) { $fileListResponse.Content | Set-Content -Path (Join-Path $LogDirectory "02_Step2_Response_SUCCESS.xml") }
-
-    # The response contains XML fragments that are HTML-encoded. We must decode this before treating it as XML.
-    Add-Type -AssemblyName System.Web
-    $decodedContent = [System.Web.HttpUtility]::HtmlDecode($fileListResponse.Content)
-    $fileListResponseXml = [xml]$decodedContent
-    Write-Host "Successfully received and DECODED Step 2 response." -ForegroundColor Green
-    
-    $fileIdentityMap = @{}
-    
-    # Get the two main lists of updates from the now correctly-decoded response
-    $newUpdates = $fileListResponseXml.Envelope.Body.SyncUpdatesResponse.SyncUpdatesResult.NewUpdates.UpdateInfo
-    $allExtendedUpdates = $fileListResponseXml.Envelope.Body.SyncUpdatesResponse.SyncUpdatesResult.ExtendedUpdateInfo.Updates.Update
-
-    Write-Host "--- Correlating Update Information ---" -ForegroundColor Magenta
-
-    # Filter the 'NewUpdates' list to only include items that are actual downloadable files.
-    # These are identified by the presence of the <SecuredFragment> tag inside their inner XML.
-    $downloadableUpdates = $newUpdates | Where-Object { $_.Xml.Properties.SecuredFragment }
-
-    Write-Host "Found $($downloadableUpdates.Count) potentially downloadable packages." -ForegroundColor Cyan
-
-    # Now, process each downloadable update
-    foreach ($update in $downloadableUpdates) {
-        $lookupId = $update.ID
+    if (-not $ExistingInstallerFilesPath) {
+        # Step 1: Get Cookie
+        Write-Host "Step 1: Getting authentication cookie..."
+        $cookieRequestPayload = $cookieXmlTemplate
+        If ($debugSaveFiles) { $cookieRequestPayload | Set-Content -Path (Join-Path $LogDirectory "01_Step1_Request.xml") }
         
-        # Find the matching entry in the 'ExtendedUpdateInfo' list using the same numeric ID.
-        $extendedInfo = $allExtendedUpdates | Where-Object { $_.ID -eq $lookupId } | Select-Object -First 1
+        $cookieResponse = Invoke-WebRequest -Uri $baseUri -Method Post -Body $cookieRequestPayload -Headers $headers -UseBasicParsing
+        If ($debugSaveFiles) { $cookieResponse.Content | Set-Content -Path (Join-Path $LogDirectory "01_Step1_Response.xml"); Write-Host "  -> Saved request and response logs for Step 1." }
+
+        $cookieResponseXml = [xml]$cookieResponse.Content
+        $encryptedCookieData = $cookieResponseXml.Envelope.Body.GetCookieResponse.GetCookieResult.EncryptedData
+        Write-Host "Success. Cookie received." -ForegroundColor Green
+
+        # Step 2: Get File List
+        Write-Host "Step 2: Getting file list..."
+        $fileListRequestPayload = $fileListXmlTemplate -f $encryptedCookieData, $storeCategoryId, $currentBranch, $flightRing, $flightingBranchName
+        If ($debugSaveFiles) { [System.IO.File]::WriteAllText((Join-Path $LogDirectory "02_Step2_Request_AUTOMATED.xml"), $fileListRequestPayload, [System.Text.UTF8Encoding]::new($false)) }
+
+        $fileListResponse = Invoke-WebRequest -Uri $baseUri -Method Post -Body $fileListRequestPayload -Headers $headers -UseBasicParsing
+        If ($debugSaveFiles) { $fileListResponse.Content | Set-Content -Path (Join-Path $LogDirectory "02_Step2_Response_SUCCESS.xml") }
+
+        # The response contains XML fragments that are HTML-encoded. We must decode this before treating it as XML.
+        Add-Type -AssemblyName System.Web
+        $decodedContent = [System.Web.HttpUtility]::HtmlDecode($fileListResponse.Content)
+        $fileListResponseXml = [xml]$decodedContent
+        Write-Host "Successfully received and DECODED Step 2 response." -ForegroundColor Green
         
-        if (-not $extendedInfo) {
-            Write-Warning "Could not find matching ExtendedInfo for downloadable update ID $lookupId. Skipping."
-            continue
-        }
+        $fileIdentityMap = @{}
         
-        # From the extended info, get the actual package file and ignore the metadata .cab files.
-        $fileNode = $extendedInfo.Xml.Files.File | Where-Object { $_.FileName -and $_.FileName -notlike "Abm_*" } | Select-Object -First 1
+        # Get the two main lists of updates from the now correctly-decoded response
+        $newUpdates = $fileListResponseXml.Envelope.Body.SyncUpdatesResponse.SyncUpdatesResult.NewUpdates.UpdateInfo
+        $allExtendedUpdates = $fileListResponseXml.Envelope.Body.SyncUpdatesResponse.SyncUpdatesResult.ExtendedUpdateInfo.Updates.Update
 
-        if (-not $fileNode) {
-            Write-Warning "Found matching ExtendedInfo for ID $lookupId, but it contains no valid file node. Skipping."
-            continue
-        }
+        Write-Host "--- Correlating Update Information ---" -ForegroundColor Magenta
 
-        # Additional parsing
-        $fileName = $fileNode.FileName
-        $updateGuid = $update.Xml.UpdateIdentity.UpdateID
-        $revNum = $update.Xml.UpdateIdentity.RevisionNumber
-        $fullIdentifier = $fileNode.GetAttribute("InstallerSpecificIdentifier")
+        # Filter the 'NewUpdates' list to only include items that are actual downloadable files.
+        # These are identified by the presence of the <SecuredFragment> tag inside their inner XML.
+        $downloadableUpdates = $newUpdates | Where-Object { $_.Xml.Properties.SecuredFragment }
 
-        # Define the regex based on the official package identity structure.
-        # <Name>_<Version>_<Architecture>_<ResourceId>_<PublisherId>
-        $regex = "^(?<Name>.+?)_(?<Version>\d+\.\d+\.\d+\.\d+)_(?<Architecture>[a-zA-Z0-9]+)_(?<ResourceId>.*?)_(?<PublisherId>[a-hjkmnp-tv-z0-9]{13})$"
-        
-        $packageInfo = [PSCustomObject]@{
-            FullName       = $fullIdentifier
-            FileName       = $fileName
-            UpdateID       = $updateGuid
-            RevisionNumber = $revNum
-        }
+        Write-Host "Found $($downloadableUpdates.Count) potentially downloadable packages." -ForegroundColor Cyan
 
-        if ($fullIdentifier -match $regex) {
-            # If the regex matches, populate the object with the named capture groups
-            $packageInfo | Add-Member -MemberType NoteProperty -Name "PackageName" -Value $matches.Name
-            $packageInfo | Add-Member -MemberType NoteProperty -Name "Version" -Value $matches.Version
-            $packageInfo | Add-Member -MemberType NoteProperty -Name "Architecture" -Value $matches.Architecture
-            $packageInfo | Add-Member -MemberType NoteProperty -Name "ResourceId" -Value $matches.ResourceId
-            $packageInfo | Add-Member -MemberType NoteProperty -Name "PublisherId" -Value $matches.PublisherId
-        } else {
-            # Fallback for any identifiers that don't match the pattern
-            $packageInfo | Add-Member -MemberType NoteProperty -Name "PackageName" -Value "Unknown (Parsing Failed)"
-            $packageInfo | Add-Member -MemberType NoteProperty -Name "Architecture" -Value "unknown"
-        }
-
-        # Use the full, unique identifier as the key in the map
-        $fileIdentityMap[$fullIdentifier] = $packageInfo
-        
-        Write-Host "  -> CORRELATED: '$($packageInfo.PackageName)' ($($packageInfo.Architecture))" -ForegroundColor Green
-    }
-
-    Write-Host "--- Correlation Complete ---" -ForegroundColor Magenta
-    Write-Host "Found and prepared $($fileIdentityMap.Count) downloadable files." -ForegroundColor Green
-
-
-    # --- Step 3: Filter, Get URLs, and Download ---
-    try {
-        # Get the current system's processor architecture and map it to the script's naming convention
-        $systemArch = switch ($env:PROCESSOR_ARCHITECTURE) {
-            "AMD64" { "x64" }
-            "ARM64" { "arm64" }
-            "x86"   { "x86" }
-            default { "unknown" }
-        }
-        
-        if ($systemArch -eq "unknown") {
-            throw "Could not determine system architecture from '$($env:PROCESSOR_ARCHITECTURE)'."
-        }
-        Write-Host "Step 3: Filtering packages for your system architecture ('$systemArch')..." -ForegroundColor Magenta
-
-        # --- Filter the packages ---
-
-        # 1. Isolate the Microsoft.WindowsStore packages and find the latest version
-        $latestStorePackage = $fileIdentityMap.Values |
-            Where-Object { $_.PackageName -eq 'Microsoft.WindowsStore' } |
-            Sort-Object { [version]$_.Version } -Descending |
-            Select-Object -First 1
-
-        # 2. Get all other dependencies that match the system architecture (or are neutral)
-        $filteredDependencies = $fileIdentityMap.Values |
-            Where-Object {
-                ($_.PackageName -ne 'Microsoft.WindowsStore') -and
-                ( ($_.Architecture -eq $systemArch) -or ($_.Architecture -eq 'neutral') )
-            }
-
-        # 3. Combine the lists for the final download queue
-        $packagesToDownload = @()
-        if ($latestStorePackage) {
-            $packagesToDownload += $latestStorePackage
-            Write-Host "  -> Found latest Store package: $($latestStorePackage.FullName)" -ForegroundColor Green
-        } else {
-            Write-Warning "Could not find any Microsoft.WindowsStore package."
-        }
-
-        $packagesToDownload += $filteredDependencies
-        Write-Host "  -> Found $($filteredDependencies.Count) dependencies for '$systemArch' architecture." -ForegroundColor Green
-        Write-Host "Total files to download: $($packagesToDownload.Count)" -ForegroundColor Cyan
-        Write-Host "------------------------------------------------------------"
-
-
-        # --- Loop through the filtered list, get URLs, and download ---
-        Write-Host "Step 4: Fetching URLs and downloading files..." -ForegroundColor Magenta
-
-        $originalPref = $ProgressPreference
-        $ProgressPreference = 'SilentlyContinue'
-        
-        foreach ($package in $packagesToDownload) {
-            Write-Host "Processing: $($package.FullName)"
-
-            # Get the download URL for this specific package
-            $fileUrlRequestPayload = $fileUrlXmlTemplate -f $encryptedCookieData, $package.UpdateID, $package.RevisionNumber, $currentBranch, $flightRing, $flightingBranchName
-            $fileUrlResponse = Invoke-WebRequest -Uri "$baseUri/secured" -Method Post -Body $fileUrlRequestPayload -Headers $headers -UseBasicParsing
-            $fileUrlResponseXml = [xml]$fileUrlResponse.Content
-
-            $fileLocations = $fileUrlResponseXml.Envelope.Body.GetExtendedUpdateInfo2Response.GetExtendedUpdateInfo2Result.FileLocations.FileLocation
-            $baseFileName = [System.IO.Path]::GetFileNameWithoutExtension($package.FileName)
-            $downloadUrl = ($fileLocations | Where-Object { $_.Url -like "*$baseFileName*" }).Url
-
-            if (-not $downloadUrl) {
-                Write-Warning "  -> Could not retrieve download URL for $($package.FileName). Skipping."
-                continue
-            }
-            if ($noDownload) {
-                Write-Host "  -> Skipping download for $($package.FullName) because of -noDownload switch." -ForegroundColor Yellow
-                continue
-            }
-
-            # Download the file
-            # Construct a more descriptive filename using the package's full name and its original extension
-            $fileExtension = [System.IO.Path]::GetExtension($package.FileName)
-            $newFileName = "$($package.FullName)$($fileExtension)"
-            $filePath = Join-Path $workingDir $newFileName
+        # Now, process each downloadable update
+        foreach ($update in $downloadableUpdates) {
+            $lookupId = $update.ID
             
-            Write-Host "  -> Downloading from: $downloadUrl" -ForegroundColor Gray
-            Write-Host "  -> Saving to: $filePath"
-
-            try {
-                Invoke-WebRequest -Uri $downloadUrl -OutFile $filePath -UseBasicParsing
-                Write-Host "  -> SUCCESS: Download complete." -ForegroundColor Green
-            } catch {
-                Write-Error "  -> FAILED to download $($newFileName). Error: $($_.Exception.Message)"
+            # Find the matching entry in the 'ExtendedUpdateInfo' list using the same numeric ID.
+            $extendedInfo = $allExtendedUpdates | Where-Object { $_.ID -eq $lookupId } | Select-Object -First 1
+            
+            if (-not $extendedInfo) {
+                Write-Warning "Could not find matching ExtendedInfo for downloadable update ID $lookupId. Skipping."
+                continue
             }
-            Write-Host ""
+            
+            # From the extended info, get the actual package file and ignore the metadata .cab files.
+            $fileNode = $extendedInfo.Xml.Files.File | Where-Object { $_.FileName -and $_.FileName -notlike "Abm_*" } | Select-Object -First 1
+
+            if (-not $fileNode) {
+                Write-Warning "Found matching ExtendedInfo for ID $lookupId, but it contains no valid file node. Skipping."
+                continue
+            }
+
+            # Additional parsing
+            $fileName = $fileNode.FileName
+            $updateGuid = $update.Xml.UpdateIdentity.UpdateID
+            $revNum = $update.Xml.UpdateIdentity.RevisionNumber
+            $fullIdentifier = $fileNode.GetAttribute("InstallerSpecificIdentifier")
+
+            # Define the regex based on the official package identity structure.
+            # <Name>_<Version>_<Architecture>_<ResourceId>_<PublisherId>
+            $regex = "^(?<Name>.+?)_(?<Version>\d+\.\d+\.\d+\.\d+)_(?<Architecture>[a-zA-Z0-9]+)_(?<ResourceId>.*?)_(?<PublisherId>[a-hjkmnp-tv-z0-9]{13})$"
+            
+            $packageInfo = [PSCustomObject]@{
+                FullName       = $fullIdentifier
+                FileName       = $fileName
+                UpdateID       = $updateGuid
+                RevisionNumber = $revNum
+            }
+
+            if ($fullIdentifier -match $regex) {
+                # If the regex matches, populate the object with the named capture groups
+                $packageInfo | Add-Member -MemberType NoteProperty -Name "PackageName" -Value $matches.Name
+                $packageInfo | Add-Member -MemberType NoteProperty -Name "Version" -Value $matches.Version
+                $packageInfo | Add-Member -MemberType NoteProperty -Name "Architecture" -Value $matches.Architecture
+                $packageInfo | Add-Member -MemberType NoteProperty -Name "ResourceId" -Value $matches.ResourceId
+                $packageInfo | Add-Member -MemberType NoteProperty -Name "PublisherId" -Value $matches.PublisherId
+            } else {
+                # Fallback for any identifiers that don't match the pattern
+                $packageInfo | Add-Member -MemberType NoteProperty -Name "PackageName" -Value "Unknown (Parsing Failed)"
+                $packageInfo | Add-Member -MemberType NoteProperty -Name "Architecture" -Value "unknown"
+            }
+
+            # Use the full, unique identifier as the key in the map
+            $fileIdentityMap[$fullIdentifier] = $packageInfo
+            
+            Write-Host "  -> CORRELATED: '$($packageInfo.PackageName)' ($($packageInfo.Architecture))" -ForegroundColor Green
         }
-        
-        $ProgressPreference = $originalPref
 
-        Write-Host "------------------------------------------------------------"
-        Write-Host "Finished downloading packages to: $workingDir" -ForegroundColor Green
+        Write-Host "--- Correlation Complete ---" -ForegroundColor Magenta
+        Write-Host "Found and prepared $($fileIdentityMap.Count) downloadable files." -ForegroundColor Green
 
-    } catch {
-        Write-Host "An error occurred during the filtering or downloading phase:" -ForegroundColor Red
-        Write-Host $_.Exception.ToString()
+
+        # --- Step 3: Filter, Get URLs, and Download ---
+        try {
+            # Get the current system's processor architecture and map it to the script's naming convention
+            $systemArch = switch ($env:PROCESSOR_ARCHITECTURE) {
+                "AMD64" { "x64" }
+                "ARM64" { "arm64" }
+                "x86"   { "x86" }
+                default { "unknown" }
+            }
+            
+            if ($systemArch -eq "unknown") {
+                throw "Could not determine system architecture from '$($env:PROCESSOR_ARCHITECTURE)'."
+            }
+            Write-Host "Step 3: Filtering packages for your system architecture ('$systemArch')..." -ForegroundColor Magenta
+
+            # --- Filter the packages ---
+
+            # 1. Isolate the Microsoft.WindowsStore packages and find the latest version
+            $latestStorePackage = $fileIdentityMap.Values |
+                Where-Object { $_.PackageName -eq 'Microsoft.WindowsStore' } |
+                Sort-Object { [version]$_.Version } -Descending |
+                Select-Object -First 1
+
+            # 2. Get all other dependencies that match the system architecture (or are neutral)
+            $filteredDependencies = $fileIdentityMap.Values |
+                Where-Object {
+                    ($_.PackageName -ne 'Microsoft.WindowsStore') -and
+                    ( ($_.Architecture -eq $systemArch) -or ($_.Architecture -eq 'neutral') )
+                }
+
+            # 3. Combine the lists for the final download queue
+            $packagesToDownload = @()
+            if ($latestStorePackage) {
+                $packagesToDownload += $latestStorePackage
+                Write-Host "  -> Found latest Store package: $($latestStorePackage.FullName)" -ForegroundColor Green
+            } else {
+                Write-Warning "Could not find any Microsoft.WindowsStore package."
+            }
+
+            $packagesToDownload += $filteredDependencies
+            Write-Host "  -> Found $($filteredDependencies.Count) dependencies for '$systemArch' architecture." -ForegroundColor Green
+            Write-Host "Total files to download: $($packagesToDownload.Count)" -ForegroundColor Cyan
+            Write-Host "------------------------------------------------------------"
+
+
+            # --- Loop through the filtered list, get URLs, and download ---
+            Write-Host "Step 4: Fetching URLs and downloading files..." -ForegroundColor Magenta
+
+            $originalPref = $ProgressPreference
+            $ProgressPreference = 'SilentlyContinue'
+            
+            foreach ($package in $packagesToDownload) {
+                Write-Host "Processing: $($package.FullName)"
+
+                # Get the download URL for this specific package
+                $fileUrlRequestPayload = $fileUrlXmlTemplate -f $encryptedCookieData, $package.UpdateID, $package.RevisionNumber, $currentBranch, $flightRing, $flightingBranchName
+                $fileUrlResponse = Invoke-WebRequest -Uri "$baseUri/secured" -Method Post -Body $fileUrlRequestPayload -Headers $headers -UseBasicParsing
+                $fileUrlResponseXml = [xml]$fileUrlResponse.Content
+
+                $fileLocations = $fileUrlResponseXml.Envelope.Body.GetExtendedUpdateInfo2Response.GetExtendedUpdateInfo2Result.FileLocations.FileLocation
+                $baseFileName = [System.IO.Path]::GetFileNameWithoutExtension($package.FileName)
+                $downloadUrl = ($fileLocations | Where-Object { $_.Url -like "*$baseFileName*" }).Url
+
+                if (-not $downloadUrl) {
+                    Write-Warning "  -> Could not retrieve download URL for $($package.FileName). Skipping."
+                    continue
+                }
+                if ($noDownload) {
+                    Write-Host "  -> Skipping download for $($package.FullName) because of -noDownload switch." -ForegroundColor Yellow
+                    continue
+                }
+
+                # Download the file
+                # Construct a more descriptive filename using the package's full name and its original extension
+                $fileExtension = [System.IO.Path]::GetExtension($package.FileName)
+                $newFileName = "$($package.FullName)$($fileExtension)"
+                $filePath = Join-Path $workingDir $newFileName
+                
+                Write-Host "  -> Downloading from: $downloadUrl" -ForegroundColor Gray
+                Write-Host "  -> Saving to: $filePath"
+
+                try {
+                    Invoke-WebRequest -Uri $downloadUrl -OutFile $filePath -UseBasicParsing
+                    Write-Host "  -> SUCCESS: Download complete." -ForegroundColor Green
+                } catch {
+                    Write-Error "  -> FAILED to download $($newFileName). Error: $($_.Exception.Message)"
+                }
+                Write-Host ""
+            }
+            
+            $ProgressPreference = $originalPref
+
+            Write-Host "------------------------------------------------------------"
+            Write-Host "Finished downloading packages to: $workingDir" -ForegroundColor Green
+
+        } catch {
+            Write-Host "An error occurred during the filtering or downloading phase:" -ForegroundColor Red
+            Write-Host $_.Exception.ToString()
+        }
     }
 
     If ($noDownload) {
