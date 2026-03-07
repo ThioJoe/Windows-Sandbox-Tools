@@ -39,6 +39,15 @@ try { Set-ExecutionPolicy -ExecutionPolicy Unrestricted -Scope LocalMachine -Err
 # Enable Clipboard History
 Set-ItemProperty -Path "HKCU:\Software\Microsoft\Clipboard" -Name "EnableClipboardHistory" -Value 1 -Type DWord -Force
 
+# Increase the output history of powershell / cmd to max number of lines
+New-Item -Path "HKCU:\Console" -Force | Out-Null
+Set-ItemProperty -Path "HKCU:\Console" -Name "ScreenBufferSize" -Value 2147418232 -Type DWord
+
+# Disable spotlight wallpaper, and set the wallpaper to the default light theme wallpaper
+New-Item -Path "HKCU:\Software\Microsoft\Windows\CurrentVersion\DesktopSpotlight\Settings" -Force | Out-Null # Ensures the key exists
+Set-ItemProperty -Path "HKCU:\Software\Microsoft\Windows\CurrentVersion\DesktopSpotlight\Settings" -Name "EnabledState" -Value 0 -Type DWord
+Copy-Item -Path "C:\Windows\Web\Wallpaper\Windows\img0.jpg" -Destination "$env:APPDATA\Microsoft\Windows\Themes\TranscodedWallpaper" -Force # For dark theme wallpaper, use "img19.jpg" instead of img0.jpg
+
 # -----------------------------------------------------------------------------------------
 
 # ---- Add 'Open PowerShell Here' and 'Open CMD Here' to context menu -------
