@@ -47,6 +47,7 @@ Set-ItemProperty -Path "HKCU:\Console" -Name "ScreenBufferSize" -Value 214741823
 New-Item -Path "HKCU:\Software\Microsoft\Windows\CurrentVersion\DesktopSpotlight\Settings" -Force | Out-Null # Ensures the key exists
 Set-ItemProperty -Path "HKCU:\Software\Microsoft\Windows\CurrentVersion\DesktopSpotlight\Settings" -Name "EnabledState" -Value 0 -Type DWord
 Copy-Item -Path "C:\Windows\Web\Wallpaper\Windows\img0.jpg" -Destination "$env:APPDATA\Microsoft\Windows\Themes\TranscodedWallpaper" -Force # For dark theme wallpaper, use "img19.jpg" instead of img0.jpg
+reg add "HKCU\Software\Microsoft\Windows\CurrentVersion\Explorer\HideDesktopIcons\NewStartPanel" /v "{2cc5ca98-6485-489a-920e-b3e88a6ccce3}" /t REG_DWORD /d 1 /f # Removes the "about this picture" icon on desktop.
 
 # -----------------------------------------------------------------------------------------
 
