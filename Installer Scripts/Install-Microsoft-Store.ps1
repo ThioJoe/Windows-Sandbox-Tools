@@ -4,7 +4,7 @@
 
 # Author: ThioJoe
 # Repo Url: https://github.com/ThioJoe/Windows-Sandbox-Tools
-# Last Updated: February 12, 2026
+# Last Updated: April 16, 2026
 
 param(
     # Optional switch to output the generated XML files to the working directory
