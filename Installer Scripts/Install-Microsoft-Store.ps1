@@ -217,10 +217,10 @@ try {
         # Step 1: Get Cookie
         Write-Host "Step 1: Getting authentication cookie..."
         $cookieRequestPayload = $cookieXmlTemplate
-        If ($debugSaveFiles) { $cookieRequestPayload | Set-Content -Path (Join-Path $LogDirectory "01_Step1_Request.xml") }
+        If ($debugSaveFiles) { $cookieRequestPayload | Set-Content -Path (Join-Path $workingDir "01_Step1_Request.xml") }
         
         $cookieResponse = Invoke-WebRequest -Uri $baseUri -Method Post -Body $cookieRequestPayload -Headers $headers -UseBasicParsing
-        If ($debugSaveFiles) { $cookieResponse.Content | Set-Content -Path (Join-Path $LogDirectory "01_Step1_Response.xml"); Write-Host "  -> Saved request and response logs for Step 1." }
+        If ($debugSaveFiles) { $cookieResponse.Content | Set-Content -Path (Join-Path $workingDir "01_Step1_Response.xml"); Write-Host "  -> Saved request and response logs for Step 1." }
 
         $cookieResponseXml = [xml]$cookieResponse.Content
         $encryptedCookieData = $cookieResponseXml.Envelope.Body.GetCookieResponse.GetCookieResult.EncryptedData
@@ -229,10 +229,10 @@ try {
         # Step 2: Get File List
         Write-Host "Step 2: Getting file list..."
         $fileListRequestPayload = $fileListXmlTemplate -f $encryptedCookieData, $storeCategoryId, $currentBranch, $flightRing, $flightingBranchName
-        If ($debugSaveFiles) { [System.IO.File]::WriteAllText((Join-Path $LogDirectory "02_Step2_Request_AUTOMATED.xml"), $fileListRequestPayload, [System.Text.UTF8Encoding]::new($false)) }
+        If ($debugSaveFiles) { [System.IO.File]::WriteAllText((Join-Path $workingDir "02_Step2_Request_AUTOMATED.xml"), $fileListRequestPayload, [System.Text.UTF8Encoding]::new($false)) }
 
         $fileListResponse = Invoke-WebRequest -Uri $baseUri -Method Post -Body $fileListRequestPayload -Headers $headers -UseBasicParsing
-        If ($debugSaveFiles) { $fileListResponse.Content | Set-Content -Path (Join-Path $LogDirectory "02_Step2_Response_SUCCESS.xml") }
+        If ($debugSaveFiles) { $fileListResponse.Content | Set-Content -Path (Join-Path $workingDir "02_Step2_Response_SUCCESS.xml") }
 
         # The response contains XML fragments that are HTML-encoded. We must decode this before treating it as XML.
         Add-Type -AssemblyName System.Web
@@ -529,7 +529,7 @@ try {
     if ($_.Exception.Response) {
         $statusCode = $_.Exception.Response.StatusCode.value__
         $statusDescription = $_.Exception.Response.StatusDescription
-        $errorLogPath = Join-Path $LogDirectory "ERROR_Response.txt"
+        $errorLogPath = Join-Path $workingDir "ERROR_Response.txt"
         try {
             $stream = $_.Exception.Response.GetResponseStream()
             $reader = New-Object System.IO.StreamReader($stream)
