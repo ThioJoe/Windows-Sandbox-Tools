@@ -4,7 +4,7 @@
 
 # Author: ThioJoe
 # Repo Url: https://github.com/ThioJoe/Windows-Sandbox-Tools
-# Last Updated: April 16, 2026
+# Last Updated: April 24, 2026
 
 param(
     # Optional switch to output the generated XML files to the working directory
@@ -16,11 +16,17 @@ param(
     # Optional switch to skip the download and install, but still show the packages found 
     [switch]$noDownload,
 
-    # Optional path to a local directory containing the installation files. If provided, the download steps will be skipped.
+    # Optional path to a local directory containing the installation files. If provided, the download steps will be skipped if the cached files are up to date.
     #   - Just copy the entire "MSStore Install" folder with the files the script normally downloads, and put it in your mounted folder to avoid having to re-download it.
     #        - You can find the "MSStore Install" folder in the "Downloads" folder.
     #   - Make sure to use the mounted path from the perspective of within the sandbox.
-    [string]$ExistingInstallerFilesPath
+    [string]$ExistingInstallerFilesPath,
+
+    # If set, forces using the installer files from ExistingInstallerFilesPath even if a new version exists. Still warns about there being a new version.
+    [switch]$ForceCachedFilesOnly,
+
+    # If set, implies ForceCachedFilesOnly and uses cached installer files only, but does not even bother checking for a latest version.
+    [switch]$NoCheckLatestVersion
 )
 
 # --- Parameter Usage Examples ---
@@ -37,6 +43,16 @@ param(
 #    .\Install-Microsoft-Store.ps1 -debugSaveFiles
 
 # =======================================================
+
+# Validate parameter combinations
+if ($NoCheckLatestVersion) {
+    $ForceCachedFilesOnly = [switch]::new($true)
+}
+if ($ForceCachedFilesOnly -and [string]::IsNullOrWhiteSpace($ExistingInstallerFilesPath)) {
+    Write-Host "Error: -ForceCachedFilesOnly requires -ExistingInstallerFilesPath to be specified." -ForegroundColor Red
+    Read-Host "Press Enter to exit"
+    exit 1
+}
 
 # --- Configuration ---
 # Note: These defaults should work for the regular current build of Microsoft Store, but I haven't tested using any of the other values. So fetching insider builds of MS Store (if any) might not work.
@@ -74,26 +90,22 @@ $subfolderName = "MSStore Install"
 # Category ID for the Microsoft Store app package
 $storeCategoryId = "64293252-5926-453c-9494-2d4021f1c78d" 
 
+# Set up the default download directory
+$workingDir = Join-Path -Path $userDownloadsFolder -ChildPath $subfolderName
+$pauseAtEnd = $false
+
 if ($ExistingInstallerFilesPath) {
-    if (Test-Path -Path $ExistingInstallerFilesPath) {
-        $workingDir = $ExistingInstallerFilesPath
-        Write-Host "Using local source path: $workingDir" -ForegroundColor Yellow
-    } else {
+    if (-not (Test-Path -Path $ExistingInstallerFilesPath)) {
         Write-Error "The specified local source path does not exist: $ExistingInstallerFilesPath"
         return
-    }
-} else {
-    # Combine them to create the full working directory path
-    $workingDir = Join-Path -Path $userDownloadsFolder -ChildPath $subfolderName
-    
-    # Create the directory if it doesn't exist
-    if (-not (Test-Path -Path $workingDir)) {
-        New-Item -Path $workingDir -ItemType Directory -Force | Out-Null
     }
 }
 
 If ($debugSaveFiles) {
-    Write-Host "All files (logs, downloads) will be saved to: '$workingDir'" -ForegroundColor Yellow
+    if (-not (Test-Path -Path $workingDir)) {
+        New-Item -Path $workingDir -ItemType Directory -Force | Out-Null
+    }
+    Write-Host "All new files (logs, downloads) will be saved to: '$workingDir'" -ForegroundColor Yellow
 }
 
 # --- XML Templates ---
@@ -221,7 +233,7 @@ $headers = @{ "Content-Type" = "application/soap+xml; charset=utf-8" }
 $baseUri = "https://fe3.delivery.mp.microsoft.com/ClientWebService/client.asmx"
 
 try {
-    if (-not $ExistingInstallerFilesPath) {
+    if (-not $NoCheckLatestVersion) {
         # Step 1: Get Cookie
         Write-Host "Step 1: Getting authentication cookie..."
         $cookieRequestPayload = $cookieXmlTemplate
@@ -366,61 +378,106 @@ try {
             Write-Host "Total files to download: $($packagesToDownload.Count)" -ForegroundColor Cyan
             Write-Host "------------------------------------------------------------"
 
+            # --- Check Cache ---
+            $useExistingFiles = $false
+            $updateDetected = $false
+
+            if ($ExistingInstallerFilesPath) {
+                $allCached = $true
+                foreach ($package in $packagesToDownload) {
+                    $fileExtension = [System.IO.Path]::GetExtension($package.FileName)
+                    $expectedFile = Join-Path $ExistingInstallerFilesPath "$($package.FullName)$($fileExtension)"
+                    if (-not (Test-Path $expectedFile)) {
+                        $allCached = $false
+                        break
+                    }
+                }
+
+                if ($allCached) {
+                    Write-Host "Cached files are up to date. Using local source path: $ExistingInstallerFilesPath" -ForegroundColor Green
+                    $useExistingFiles = $true
+                    $workingDir = $ExistingInstallerFilesPath
+                } elseif ($ForceCachedFilesOnly) {
+                    Write-Host "WARNING: Cached files are out of date or missing, but using cache anyway (-ForceCachedFilesOnly)." -ForegroundColor Yellow
+                    Write-Host "Please update your cache at: $ExistingInstallerFilesPath" -ForegroundColor Yellow
+                    $useExistingFiles = $true
+                    $workingDir = $ExistingInstallerFilesPath
+                    $updateDetected = $true
+                    $pauseAtEnd = $true
+                } else {
+                    Write-Host "Newer versions detected or cached files missing. Cache is out of date." -ForegroundColor Yellow
+                    $updateDetected = $true
+                    $pauseAtEnd = $true
+                }
+            }
+
 
             # --- Loop through the filtered list, get URLs, and download ---
-            Write-Host "Step 4: Fetching URLs and downloading files..." -ForegroundColor Magenta
-
-            $originalPref = $ProgressPreference
-            $ProgressPreference = 'SilentlyContinue'
-            
-            foreach ($package in $packagesToDownload) {
-                Write-Host "Processing: $($package.FullName)"
-
-                # Get the download URL for this specific package
-                $fileUrlRequestPayload = $fileUrlXmlTemplate -f $encryptedCookieData, $package.UpdateID, $package.RevisionNumber, $currentBranch, $flightRing, $flightingBranchName
-                $fileUrlResponse = Invoke-WebRequest -Uri "$baseUri/secured" -Method Post -Body $fileUrlRequestPayload -Headers $headers -UseBasicParsing
-                $fileUrlResponseXml = [xml]$fileUrlResponse.Content
-
-                $fileLocations = $fileUrlResponseXml.Envelope.Body.GetExtendedUpdateInfo2Response.GetExtendedUpdateInfo2Result.FileLocations.FileLocation
-                $baseFileName = [System.IO.Path]::GetFileNameWithoutExtension($package.FileName)
-                $downloadUrl = ($fileLocations | Where-Object { $_.Url -like "*$baseFileName*" }).Url
-
-                if (-not $downloadUrl) {
-                    Write-Warning "  -> Could not retrieve download URL for $($package.FileName). Skipping."
-                    continue
-                }
-                if ($noDownload) {
-                    Write-Host "  -> Skipping download for $($package.FullName) because of -noDownload switch." -ForegroundColor Yellow
-                    continue
+            if (-not $useExistingFiles) {
+                if (-not (Test-Path -Path $workingDir)) {
+                    New-Item -Path $workingDir -ItemType Directory -Force | Out-Null
                 }
 
-                # Download the file
-                # Construct a more descriptive filename using the package's full name and its original extension
-                $fileExtension = [System.IO.Path]::GetExtension($package.FileName)
-                $newFileName = "$($package.FullName)$($fileExtension)"
-                $filePath = Join-Path $workingDir $newFileName
+                Write-Host "Step 4: Fetching URLs and downloading files..." -ForegroundColor Magenta
+
+                $originalPref = $ProgressPreference
+                $ProgressPreference = 'SilentlyContinue'
                 
-                Write-Host "  -> Downloading from: $downloadUrl" -ForegroundColor Gray
-                Write-Host "  -> Saving to: $filePath"
+                foreach ($package in $packagesToDownload) {
+                    Write-Host "Processing: $($package.FullName)"
 
-                try {
-                    Invoke-WebRequest -Uri $downloadUrl -OutFile $filePath -UseBasicParsing
-                    Write-Host "  -> SUCCESS: Download complete." -ForegroundColor Green
-                } catch {
-                    Write-Error "  -> FAILED to download $($newFileName). Error: $($_.Exception.Message)"
+                    # Get the download URL for this specific package
+                    $fileUrlRequestPayload = $fileUrlXmlTemplate -f $encryptedCookieData, $package.UpdateID, $package.RevisionNumber, $currentBranch, $flightRing, $flightingBranchName
+                    $fileUrlResponse = Invoke-WebRequest -Uri "$baseUri/secured" -Method Post -Body $fileUrlRequestPayload -Headers $headers -UseBasicParsing
+                    $fileUrlResponseXml = [xml]$fileUrlResponse.Content
+
+                    $fileLocations = $fileUrlResponseXml.Envelope.Body.GetExtendedUpdateInfo2Response.GetExtendedUpdateInfo2Result.FileLocations.FileLocation
+                    $baseFileName = [System.IO.Path]::GetFileNameWithoutExtension($package.FileName)
+                    $downloadUrl = ($fileLocations | Where-Object { $_.Url -like "*$baseFileName*" }).Url
+
+                    if (-not $downloadUrl) {
+                        Write-Warning "  -> Could not retrieve download URL for $($package.FileName). Skipping."
+                        continue
+                    }
+                    if ($noDownload) {
+                        Write-Host "  -> Skipping download for $($package.FullName) because of -noDownload switch." -ForegroundColor Yellow
+                        continue
+                    }
+
+                    # Download the file
+                    # Construct a more descriptive filename using the package's full name and its original extension
+                    $fileExtension = [System.IO.Path]::GetExtension($package.FileName)
+                    $newFileName = "$($package.FullName)$($fileExtension)"
+                    $filePath = Join-Path $workingDir $newFileName
+                    
+                    Write-Host "  -> Downloading from: $downloadUrl" -ForegroundColor Gray
+                    Write-Host "  -> Saving to: $filePath"
+
+                    try {
+                        Invoke-WebRequest -Uri $downloadUrl -OutFile $filePath -UseBasicParsing
+                        Write-Host "  -> SUCCESS: Download complete." -ForegroundColor Green
+                    } catch {
+                        Write-Error "  -> FAILED to download $($newFileName). Error: $($_.Exception.Message)"
+                    }
+                    Write-Host ""
                 }
-                Write-Host ""
-            }
-            
-            $ProgressPreference = $originalPref
+                
+                $ProgressPreference = $originalPref
 
-            Write-Host "------------------------------------------------------------"
-            Write-Host "Finished downloading packages to: $workingDir" -ForegroundColor Green
+                Write-Host "------------------------------------------------------------"
+                Write-Host "Finished downloading packages to: $workingDir" -ForegroundColor Green
+            } else {
+                Write-Host "Step 4: Skipping download step (Using existing cached files)." -ForegroundColor Cyan
+                Write-Host "------------------------------------------------------------"
+            }
 
         } catch {
             Write-Host "An error occurred during the filtering or downloading phase:" -ForegroundColor Red
             Write-Host $_.Exception.ToString()
         }
+    } else {
+        $workingDir = $ExistingInstallerFilesPath
+        Write-Host "Skipping update checks (-NoCheckLatestVersion). Using existing files from: $workingDir" -ForegroundColor Cyan
     }
 
     If ($noDownload) {
@@ -549,4 +606,13 @@ try {
     } else {
         Write-Host $_.Exception.ToString()
     }
+}
+
+if ($updateDetected) {
+    Write-Host "`nACTION REQUIRED: Newer file versions were downloaded." -ForegroundColor Yellow
+    Write-Host "Please update your cache at: $ExistingInstallerFilesPath" -ForegroundColor Yellow
+}
+
+if ($pauseAtEnd) {
+    Read-Host "`nPress Enter to exit"
 }
