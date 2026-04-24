@@ -43,11 +43,11 @@ try { Set-ExecutionPolicy -ExecutionPolicy Unrestricted -Scope LocalMachine -Err
 Set-ItemProperty -Path "HKCU:\Software\Microsoft\Clipboard" -Name "EnableClipboardHistory" -Value 1 -Type DWord -Force
 
 # Increase the output history of powershell / cmd to max number of lines
-New-Item -Path "HKCU:\Console" -Force | Out-Null
-Set-ItemProperty -Path "HKCU:\Console" -Name "ScreenBufferSize" -Value 2147418232 -Type DWord
+If (!(Test-Path "HKCU:\Console")) { New-Item -Path "HKCU:\Console" -Force | Out-Null }
+Set-ItemProperty -Path "HKCU:\Console" -Name "ScreenBufferSize" -Value 4294967295 -Type DWord
 
 # Disable spotlight wallpaper, and set the wallpaper to the default light theme wallpaper
-New-Item -Path "HKCU:\Software\Microsoft\Windows\CurrentVersion\DesktopSpotlight\Settings" -Force | Out-Null # Ensures the key exists
+If (!(Test-Path "HKCU:\Software\Microsoft\Windows\CurrentVersion\DesktopSpotlight\Settings")) { New-Item -Path "HKCU:\Software\Microsoft\Windows\CurrentVersion\DesktopSpotlight\Settings" -Force | Out-Null } # Ensures the key exists
 Set-ItemProperty -Path "HKCU:\Software\Microsoft\Windows\CurrentVersion\DesktopSpotlight\Settings" -Name "EnabledState" -Value 0 -Type DWord
 Copy-Item -Path "C:\Windows\Web\Wallpaper\Windows\img0.jpg" -Destination "$env:APPDATA\Microsoft\Windows\Themes\TranscodedWallpaper" -Force # For dark theme wallpaper, use "img19.jpg" instead of img0.jpg
 reg add "HKCU\Software\Microsoft\Windows\CurrentVersion\Explorer\HideDesktopIcons\NewStartPanel" /v "{2cc5ca98-6485-489a-920e-b3e88a6ccce3}" /t REG_DWORD /d 1 /f # Removes the "about this picture" icon on desktop.
