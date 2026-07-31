@@ -27,10 +27,16 @@
 
 	<!-- Run the powershell script from the mapped folder -->
 	<LogonCommand>
-		<!-- The seemingly redundant command nesting makes it so the powershell window is visible when running. -->
+			<!-- This version with the seemingly redundant command nesting makes it so the powershell window is visible when running. -->
 		<Command>powershell -executionpolicy Bypass -command "start powershell {-file C:\Users\WDAGUtilityAccount\Desktop\HostShared\SandboxStartup.ps1 -launchingSandbox}"</Command>
-		<!-- Note: You can add more powershell commands in additional blocks. For example you can uncomment the line below. -->
-		<!-- <Command>powershell -executionpolicy Bypass -command "start powershell {-file \"C:\Users\WDAGUtilityAccount\Desktop\HostShared\Set Theme Dark Mode.ps1\"}"</Command> -->
+		
+			<!-- This version runs it without the visible powershell window. -->
+		<!-- <Command>powershell -executionpolicy Bypass -file C:\Users\WDAGUtilityAccount\Desktop\HostShared\SandboxStartup.ps1 -launchingSandbox"</Command> -->
+		
+			<!-- Note: You can add more powershell commands in additional blocks. For example you can uncomment the line below. -->
+			<!-- The line below runs the set dark mode script. The optional "AutoRange" parameter will have the script run only between certain times you choose (24 hour format).-->
+			<!-- The scripts will be run simultaneously, so if your SandboxStartup.ps1 script has any lines to change the wallpaper, they may step on each other. -->
+		<!-- <Command>powershell -executionpolicy Bypass -file "C:\Users\WDAGUtilityAccount\Desktop\HostShared\Set Theme Dark Mode.ps1" -AutoRange "18:00-06:00"</Command> -->
 	</LogonCommand>
 
 </Configuration> 
