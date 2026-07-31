@@ -8,13 +8,21 @@ Format: "HH:MM-HH:MM" (e.g., "18:00-06:00" for 6 PM to 6 AM).
 If the current time is outside this range, the script will exit without making changes.
 If this parameter is omitted, the theme is applied immediately.
 
+.PARAMETER NoRestartExplorer
+Optional switch. If specified, Explorer will not be restarted after applying the theme.
+Note that some changes may not appear until Explorer is restarted or you sign out and back in.
+
 You can put this in your .wsb config file or run it from another .ps1 script.
 
 .EXAMPLE
 .\Set Theme Dark Mode.ps1 -AutoRange "18:00-06:00"
+
+.EXAMPLE
+.\Set Theme Dark Mode.ps1 -NoRestartExplorer
 #>
 param(
-    [string]$AutoRange
+    [string]$AutoRange,
+    [switch]$NoRestartExplorer
 )
 
 if (-not [string]::IsNullOrWhiteSpace($AutoRange)) {
@@ -64,7 +72,11 @@ $SEND_CHANGE = 0x02
 [Wallpaper]::SystemParametersInfo($SPI_SETDESKWALLPAPER, 0, $wallpaperPath, ($UPDATE_INI_FILE -bor $SEND_CHANGE))
 
 # Restart Explorer to apply changes
-Write-Host "Restarting Explorer..."
-Stop-Process -Name explorer -Force
-Start-Process explorer
-Write-Host "Dark mode enabled and wallpaper updated successfully! Explorer has been restarted."
+if ($NoRestartExplorer) {
+    Write-Host "Dark mode enabled and wallpaper updated successfully! Explorer was not restarted."
+} else {
+    Write-Host "Restarting Explorer..."
+    Stop-Process -Name explorer -Force
+    Start-Process explorer
+    Write-Host "Dark mode enabled and wallpaper updated successfully! Explorer has been restarted."
+}

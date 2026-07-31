@@ -137,6 +137,12 @@ If (($null -ne $notepadPath) -or ($null -ne $notepadPlusPlusPath)) {
 	} 
 }
 
+	# Optional: Uncomment to run the Set Dark Theme script at startup. (The & runs one script from another)
+	# The AutoRange parameter can be used to only apply the theme during certain hours, such as "18:00-06:00" for night time.
+	# If you want to always apply the theme, you can omit the AutoRange parameter.
+# & "C:\Users\WDAGUtilityAccount\Desktop\HostShared\Set Theme Dark Mode.ps1" -NoRestartExplorer -AutoRange "18:00-06:00" 
+
+
 # ================================ FINALIZATION ================================
 
 # Restart Explorer so changes take effect
