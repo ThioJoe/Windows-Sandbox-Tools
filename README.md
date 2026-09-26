@@ -15,6 +15,7 @@ PowerShell scripts that can install apps or components not normally included in 
 
 - `Set Theme Dark Mode.ps1` - Sets the Sandbox to Dark theme and also changes to a dark wallpaper
 - `Set Theme Light Mode.ps1` - Restores the Light theme. Doesn't currently change the wallpaper back though.
+- `Start-Agent-Tunnel.ps1` - Sets up an instant, disposable SSH connection into the sandbox without needing to open any ports. It also generates a connection instructions zip file you can give right to your agent.
 
 ---------
 
