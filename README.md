@@ -17,6 +17,10 @@ PowerShell scripts that can install apps or components not normally included in 
 - `Set Theme Light Mode.ps1` - Restores the Light theme. Doesn't currently change the wallpaper back though.
 - `Start-Agent-Tunnel.ps1` - Sets up an instant, disposable SSH connection into the sandbox without needing to open any ports. It also generates a connection instructions zip file you can give right to your agent.
 
+## External Tools
+- `Create-WSB-Copy-Files.bat` - Drag file(s) onto this, and it will create a .wsb config where the sandbox will launch with those files pre-copied into it, WITHOUT needing to map a folder.
+  - Has configurable options, including whether to auto-launch a .ps1 script post-launch, if there is one
+
 ---------
 
 ## 🕑 SandboxStartup.ps1 (Startup Script)
