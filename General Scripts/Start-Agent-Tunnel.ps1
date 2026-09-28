@@ -84,6 +84,16 @@ $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
 
 # ------------------------------------------------------------------------------------------------------------------
+# Run mode. Default ($true): run SSH as a normal process on the visible desktop (the interactive session), logging
+# in as the current Sandbox user (WDAGUtilityAccount); no separate account is created. Programs the remote AI starts
+# (GUI apps, and GPU work such as Blender/OpenGL) then appear on the visible desktop instead of being confined to the
+# non-interactive service session (session 0), where windows are invisible and the GPU driver is unavailable.
+# Set to $false for the original behavior: install SSH as a Windows service under a dedicated temporary admin account.
+# In that mode the remote shell and anything it launches run in session 0.
+$RunOnDesktop = $true
+# ------------------------------------------------------------------------------------------------------------------
+
+# ------------------------------------------------------------------------------------------------------------------
 # The OpenSSH pin is from the official release asset as of 2026. Use OpenSSH-Win64.zip.
 # This is not updated very often so worth pinning. The script will check and warn if a newer version is available.
 $openSshPinnedTag = '10.0.0.0p2-Preview'
@@ -131,8 +141,36 @@ if (-not ([Security.Principal.WindowsPrincipal]$identity).IsInRole([Security.Pri
 if (-not [Environment]::Is64BitProcess -or $env:PROCESSOR_ARCHITECTURE -ne 'AMD64') {
     throw 'This script targets x64 Windows Sandbox and requires 64-bit Windows PowerShell.'
 }
-if (Get-Service -Name sshd -ErrorAction SilentlyContinue) {
-    throw 'An sshd service already exists. Use a fresh Windows Sandbox; this script will not replace an existing SSH installation.'
+# Detect leftover SSH/tunnel state from a previous run that did not clean up (for example, the window was closed with
+# the X button, which skips the finally cleanup block). Offer to remove it so a new session can start. This asks for
+# confirmation first, in case a session is still legitimately in use and would be disconnected.
+$leftoverService = Get-Service -Name sshd -ErrorAction SilentlyContinue
+$leftoverSshd = @(Get-Process -Name sshd -ErrorAction SilentlyContinue)
+$leftoverCloudflared = @(Get-Process -Name cloudflared -ErrorAction SilentlyContinue)
+if ($leftoverService -or $leftoverSshd.Count -or $leftoverCloudflared.Count) {
+    Write-Host "`nLeftover SSH/tunnel state from a previous run was found:" -ForegroundColor Yellow
+    if ($leftoverService) { Write-Host '  - An sshd service is installed.' }
+    if ($leftoverSshd.Count) { Write-Host "  - $($leftoverSshd.Count) sshd process(es) running." }
+    if ($leftoverCloudflared.Count) { Write-Host "  - $($leftoverCloudflared.Count) cloudflared process(es) running." }
+    Write-Host 'This usually means a previous session was not shut down cleanly. If a session is still in use, removing this will disconnect it.' -ForegroundColor Yellow
+    $leftoverAnswer = Read-Host 'Remove this leftover state and start a new session? Type YES to proceed'
+    if ($leftoverAnswer -ne 'YES') { throw 'Aborted at your request; existing SSH/tunnel state was left untouched.' }
+    if ($leftoverService) {
+        try {
+            Stop-Service -Name sshd -Force -ErrorAction SilentlyContinue
+            & (Join-Path $env:WINDIR 'System32\sc.exe') delete sshd 2>$null | Out-Null
+        } catch { Write-Warning "Could not remove the existing sshd service: $($_.Exception.Message)" }
+    }
+    foreach ($leftoverProcess in ($leftoverSshd + $leftoverCloudflared)) {
+        try { if (-not $leftoverProcess.HasExited) { $leftoverProcess.Kill(); [void]$leftoverProcess.WaitForExit(5000) } } catch { Write-Warning $_.Exception.Message }
+    }
+    # The service is deleted asynchronously; wait briefly for it to disappear before continuing (New-Service would fail otherwise).
+    if ($leftoverService) {
+        $leftoverDeadline = [DateTime]::UtcNow.AddSeconds(10)
+        while ((Get-Service -Name sshd -ErrorAction SilentlyContinue) -and [DateTime]::UtcNow -lt $leftoverDeadline) { Start-Sleep -Milliseconds 250 }
+        if (Get-Service -Name sshd -ErrorAction SilentlyContinue) { throw 'The existing sshd service did not finish uninstalling. Close Windows Sandbox and start fresh.' }
+    }
+    Write-Host 'Leftover state removed. Continuing.' -ForegroundColor Cyan
 }
 foreach ($configName in @('config.yml', 'config.yaml')) {
     if (Test-Path -LiteralPath (Join-Path $env:USERPROFILE ".cloudflared\$configName")) {
@@ -143,7 +181,7 @@ foreach ($configName in @('config.yml', 'config.yaml')) {
 # -------------------------------------- Session values --------------------------------------
 # Unique names and paths for this run
 $sessionId = [Guid]::NewGuid().ToString('N')
-$userName = 'ai' + $sessionId.Substring(0, 10)
+if ($RunOnDesktop) { $userName = $env:USERNAME } else { $userName = 'ai' + $sessionId.Substring(0, 10) }
 $hostAlias = 'ai-sandbox-' + $sessionId.Substring(0, 12)
 $root = Join-Path $env:ProgramData "AiSandbox-$sessionId"
 $sshData = Join-Path $env:ProgramData 'ssh'
@@ -154,6 +192,9 @@ $registryPath = 'HKLM:\SOFTWARE\OpenSSH'
 $createdSshData = $false
 $createdUser = $false
 $createdService = $false
+$startedSshProcess = $false
+$sshProcess = $null
+$sshJob = $null
 $changedShell = $false
 $hadShellValue = $false
 $oldShellValue = $null
@@ -475,6 +516,8 @@ namespace AiSandbox {
     $fingerprint = (Invoke-Checked $keygen @('-l', '-E', 'sha256', '-f', "$hostKey.pub")).Trim()
 
     # --- Create the temporary administrator account ---
+    # Skipped in desktop mode, where SSH logs in as the current interactive user (see $RunOnDesktop near the top).
+    if (-not $RunOnDesktop) {
     # The random password is only needed to create the account. It is never shown or used, since login is key-only.
     $passwordBytes = New-Object byte[] 32
     $rng = [Security.Cryptography.RandomNumberGenerator]::Create()
@@ -485,6 +528,7 @@ namespace AiSandbox {
         $createdUser = $true
     } finally { $password.Dispose(); [Array]::Clear($passwordBytes, 0, $passwordBytes.Length) }
     Add-LocalGroupMember -SID ([Security.Principal.SecurityIdentifier]'S-1-5-32-544') -Member $account
+    }
 
     # --- Configure and start the SSH server ---
     # SSH can use a separate config path, but Win32-OpenSSH also expects its
@@ -546,6 +590,24 @@ Subsystem sftp "$sftpForConfig"
     [void](Invoke-Checked $icacls @($serverConfig, '/grant', '*S-1-5-11:(R)', '/Q'))
     [void](Invoke-Checked $sshd @('-t', '-f', $serverConfig))
 
+    if ($RunOnDesktop) {
+        # Desktop mode: run sshd as a child of this interactive session so the AI's processes (GUIs, and GPU work
+        # such as Blender/OpenGL) appear on the visible desktop instead of the non-interactive service session
+        # (session 0). Add it to a kill-on-close job so it also stops if this window is closed with the X button.
+        # SSH_TEST_ENVIRONMENT=1 makes Win32-OpenSSH start the remote shell with CREATE_NO_WINDOW. Without it, each
+        # non-terminal SSH command (ssh -T) opens a visible PowerShell console window on the desktop, because
+        # sshd-session.exe has no console to share. Its only other effect is translating /cygdrive/c/... style paths.
+        # This is an internal test switch in Win32-OpenSSH (checked in 10.0.0.0p2-Preview); recheck if the pin changes.
+        $env:SSH_TEST_ENVIRONMENT = '1'
+        try {
+        $sshProcess = Start-Process -FilePath $sshd -ArgumentList ('-D -f ' + (ConvertTo-NativeArgument $serverConfig) + ' -E ' + (ConvertTo-NativeArgument $sshLog)) -WindowStyle Hidden -PassThru
+        } finally { Remove-Item Env:SSH_TEST_ENVIRONMENT -ErrorAction SilentlyContinue }
+        $startedSshProcess = $true
+        $sshJob = New-Object AiSandbox.KillOnCloseJob
+        $sshJob.Add($sshProcess.Handle)
+        Start-Sleep -Milliseconds 500
+        if ($sshProcess.HasExited) { throw "sshd exited immediately (exit code $($sshProcess.ExitCode)). See the log at $sshLog." }
+    } else {
     # Register sshd as a service and start it
     $serviceCommand = (ConvertTo-NativeArgument $sshd) + ' -f ' + (ConvertTo-NativeArgument $serverConfig)
     New-Service -Name sshd -BinaryPathName $serviceCommand -DisplayName 'Disposable AI Sandbox SSH' -StartupType Manual | Out-Null
@@ -553,6 +615,7 @@ Subsystem sftp "$sftpForConfig"
     # Same required privileges used by Microsoft's install-sshd.ps1.
     [void](Invoke-Checked (Join-Path $env:WINDIR 'System32\sc.exe') @('privs', 'sshd', 'SeAssignPrimaryTokenPrivilege/SeTcbPrivilege/SeBackupPrivilege/SeRestorePrivilege/SeImpersonatePrivilege'))
     Start-Service -Name sshd
+    }
 
     # --- Optional: test SSH login locally (only with -TestConnection) ---
     if ($TestConnection) {
@@ -1018,7 +1081,9 @@ The server script downloads the latest stable cloudflared release and packages v
     $ready = $true
     while ([DateTime]::UtcNow -lt $expires) {
         if ($tunnel.HasExited) { throw 'The Cloudflare tunnel stopped. Access is being torn down.' }
-        if ((Get-Service -Name sshd).Status -ne 'Running') { throw 'The SSH service stopped. Access is being torn down.' }
+        if ($RunOnDesktop) {
+            if ($sshProcess.HasExited) { throw 'The SSH process stopped. Access is being torn down.' }
+        } elseif ((Get-Service -Name sshd).Status -ne 'Running') { throw 'The SSH service stopped. Access is being torn down.' }
         Start-Sleep -Milliseconds 500
     }
     Write-Host 'Session expired.' -ForegroundColor Yellow
@@ -1029,6 +1094,8 @@ The server script downloads the latest stable cloudflared release and packages v
     Write-Host "Diagnostics remain inside this sandbox at: $root"
     if ($createdService) {
         try { Stop-Service -Name sshd -Force -ErrorAction Stop } catch { Write-Warning "Could not stop SSH before reading logs: $($_.Exception.Message)" }
+    } elseif ($startedSshProcess -and $sshProcess -and -not $sshProcess.HasExited) {
+        try { $sshProcess.Kill(); [void]$sshProcess.WaitForExit(5000) } catch { Write-Warning "Could not stop SSH before reading logs: $($_.Exception.Message)" }
     }
 
     # Show the last 30 lines of each log, and copy the SSH logs into the session folder
@@ -1056,6 +1123,13 @@ The server script downloads the latest stable cloudflared release and packages v
     if ($tunnel) {
         try { if (-not $tunnel.HasExited) { $tunnel.Kill(); [void]$tunnel.WaitForExit(5000) } } catch { Write-Warning $_.Exception.Message }
         $tunnel.Dispose()
+    }
+
+    # Desktop mode: stop the sshd process from this session. Its kill-on-close job also stops it and its children.
+    if ($sshJob) { $sshJob.Dispose() }
+    if ($startedSshProcess -and $sshProcess) {
+        try { if (-not $sshProcess.HasExited) { $sshProcess.Kill(); [void]$sshProcess.WaitForExit(5000) } } catch { Write-Warning $_.Exception.Message }
+        $sshProcess.Dispose()
     }
 
     # Disable the account right away. It is removed after the SSH service is deleted.
