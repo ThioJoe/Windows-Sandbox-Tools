@@ -4,7 +4,7 @@
 
 # Author: ThioJoe
 # Repo Url: https://github.com/ThioJoe/Windows-Sandbox-Tools
-# Last Updated: April 24, 2026
+# Last Updated: October 13, 2026
 
 param(
     # Optional switch to output the generated XML files to the working directory
@@ -97,6 +97,7 @@ $pauseAtEnd = $false
 if ($ExistingInstallerFilesPath) {
     if (-not (Test-Path -Path $ExistingInstallerFilesPath)) {
         Write-Error "The specified local source path does not exist: $ExistingInstallerFilesPath"
+        Read-Host "Press Enter to exit"
         return
     }
 }
@@ -210,8 +211,8 @@ $fileUrlXmlTemplate = @"
         <a:To s:mustUnderstand="1">https://fe3cr.delivery.mp.microsoft.com/ClientWebService/client.asmx/secured</a:To>
         <o:Security s:mustUnderstand="1" xmlns:o="http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-wssecurity-secext-1.0.xsd">
             <u:Timestamp u:Id="_0" xmlns:u="http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-wssecurity-utility-1.0.xsd">
-                <u:Created>$((Get-Date).ToUniversalTime().ToString("yyyy-MM-dd'T'HH:mm:ss.fff'Z'"))</u:Created>
-                <u:Expires>$((Get-Date).AddMinutes(5).ToUniversalTime().ToString("yyyy-MM-dd'T'HH:mm:ss.fff'Z'"))</u:Expires>
+                <u:Created>{6}</u:Created>
+                <u:Expires>{7}</u:Expires>
             </u:Timestamp>
             <wuws:WindowsUpdateTicketsToken wsu:id="ClientMSA" xmlns:wsu="http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-wssecurity-utility-1.0.xsd" xmlns:wuws="http://schemas.microsoft.com/msus/2014/10/WindowsUpdateAuthorization">
                 <TicketType Name="MSA" Version="1.0" Policy="MBI_SSL"><user>{0}</user></TicketType>
@@ -231,6 +232,18 @@ $fileUrlXmlTemplate = @"
 # --- Script Execution ---
 $headers = @{ "Content-Type" = "application/soap+xml; charset=utf-8" }
 $baseUri = "https://fe3.delivery.mp.microsoft.com/ClientWebService/client.asmx"
+
+# If cached files were provided, first check that the update server can be reached. If it can't (for example, when networking is disabled for the sandbox), use the cached files without checking for a newer version.
+if ($ExistingInstallerFilesPath -and -not $NoCheckLatestVersion) {
+    try {
+        Invoke-WebRequest -Uri $baseUri -Method Post -Body $cookieXmlTemplate -Headers $headers -UseBasicParsing -ErrorAction Stop | Out-Null
+    } catch {
+        Write-Host "WARNING: Could not reach the update server, so the cached files will be used without checking for a newer version." -ForegroundColor Yellow
+        Write-Host "Error: $($_.Exception.Message)" -ForegroundColor Yellow
+        $NoCheckLatestVersion = [switch]::new($true)
+        $pauseAtEnd = $true
+    }
+}
 
 try {
     if (-not $NoCheckLatestVersion) {
@@ -414,7 +427,7 @@ try {
 
             # --- Loop through the filtered list, get URLs, and download ---
             if (-not $useExistingFiles) {
-                if (-not (Test-Path -Path $workingDir)) {
+                if (-not $noDownload -and -not (Test-Path -Path $workingDir)) {
                     New-Item -Path $workingDir -ItemType Directory -Force | Out-Null
                 }
 
@@ -427,7 +440,9 @@ try {
                     Write-Host "Processing: $($package.FullName)"
 
                     # Get the download URL for this specific package
-                    $fileUrlRequestPayload = $fileUrlXmlTemplate -f $encryptedCookieData, $package.UpdateID, $package.RevisionNumber, $currentBranch, $flightRing, $flightingBranchName
+                    # The timestamps are generated for each request, because values written directly in the template are fixed when the script starts and expire 5 minutes later
+                    $requestTime = (Get-Date).ToUniversalTime()
+                    $fileUrlRequestPayload = $fileUrlXmlTemplate -f $encryptedCookieData, $package.UpdateID, $package.RevisionNumber, $currentBranch, $flightRing, $flightingBranchName, $requestTime.ToString("yyyy-MM-dd'T'HH:mm:ss.fff'Z'"), $requestTime.AddMinutes(5).ToString("yyyy-MM-dd'T'HH:mm:ss.fff'Z'")
                     $fileUrlResponse = Invoke-WebRequest -Uri "$baseUri/secured" -Method Post -Body $fileUrlRequestPayload -Headers $headers -UseBasicParsing
                     $fileUrlResponseXml = [xml]$fileUrlResponse.Content
 
@@ -457,7 +472,8 @@ try {
                         Invoke-WebRequest -Uri $downloadUrl -OutFile $filePath -UseBasicParsing
                         Write-Host "  -> SUCCESS: Download complete." -ForegroundColor Green
                     } catch {
-                        Write-Error "  -> FAILED to download $($newFileName). Error: $($_.Exception.Message)"
+                        Write-Host "  -> FAILED to download $($newFileName). Error: $($_.Exception.Message)" -ForegroundColor Red
+                        $pauseAtEnd = $true
                     }
                     Write-Host ""
                 }
@@ -465,7 +481,7 @@ try {
                 $ProgressPreference = $originalPref
 
                 Write-Host "------------------------------------------------------------"
-                Write-Host "Finished downloading packages to: $workingDir" -ForegroundColor Green
+                if (-not $noDownload) { Write-Host "Finished downloading packages to: $workingDir" -ForegroundColor Green }
             } else {
                 Write-Host "Step 4: Skipping download step (Using existing cached files)." -ForegroundColor Cyan
                 Write-Host "------------------------------------------------------------"
@@ -474,6 +490,7 @@ try {
         } catch {
             Write-Host "An error occurred during the filtering or downloading phase:" -ForegroundColor Red
             Write-Host $_.Exception.ToString()
+            $pauseAtEnd = $true
         }
     } else {
         $workingDir = $ExistingInstallerFilesPath
@@ -492,15 +509,6 @@ try {
     # --- Step 5: Install Downloaded Packages ---
     Write-Host "------------------------------------------------------------"
     Write-Host "Step 5: Installing packages..." -ForegroundColor Magenta
-    Write-Host "This step requires Administrator privileges."
-
-    # 1. Check for Administrator rights
-    if (-not ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
-        Write-Error "Installation failed. Please re-run the script with 'Run as Administrator'."
-        # Add a pause so the user can see the message before the window closes.
-        Read-Host "Press Enter to exit"
-        exit
-    }
 
     # 2. Define the installation order for dependencies based on their base names
     #    The order here is critical for dependencies.
@@ -514,13 +522,29 @@ try {
     # 3. Get all downloaded package files and separate the main app from dependencies
     try {
         $allDownloadedFiles = Get-ChildItem -Path $workingDir -File | Where-Object { $_.Extension -in '.appx', '.msix', '.appxbundle', '.msixbundle' }
+
+        # If this run found the list of packages to install and all of those files are in the folder, ignore any other files in it
+        if ($packagesToDownload) {
+            $expectedFileNames = $packagesToDownload | ForEach-Object { "$($_.FullName)$([System.IO.Path]::GetExtension($_.FileName))" }
+            $expectedFiles = $allDownloadedFiles | Where-Object { $_.Name -in $expectedFileNames }
+            if (@($expectedFiles).Count -eq @($expectedFileNames).Count) {
+                $allDownloadedFiles = $expectedFiles
+            }
+        }
+
+        # Keep only the highest version of each package (by name and architecture), in case the folder also has older files, such as a cache folder with old and new versions
+        # File names follow the package identity format: <Name>_<Version>_<Architecture>_<ResourceId>_<PublisherId>
+        $allDownloadedFiles = $allDownloadedFiles |
+            Group-Object { ($_.BaseName -split '_')[0,2] -join '_' } |
+            ForEach-Object { $_.Group | Sort-Object { ($_.BaseName -split '_')[1] -as [version] } -Descending | Select-Object -First 1 }
         
         $storePackageFile = $allDownloadedFiles | Where-Object { $_.Name -like 'Microsoft.WindowsStore*' } | Select-Object -First 1
         $dependencyFiles = $allDownloadedFiles | Where-Object { $_.Name -notlike 'Microsoft.WindowsStore*' }
 
         if (-not $dependencyFiles -and -not $storePackageFile) {
             Write-Warning "No package files found in '$workingDir' to install."
-            return # Exits this part of the script gracefully
+            $pauseAtEnd = $true
+            return # Exits the script, but the 'finally' block at the end still runs
         }
 
         # 4. Install dependencies in the correct, predefined order
@@ -533,11 +557,25 @@ try {
             foreach ($package in $packagesInGroup) {
                 Write-Host "  -> Installing $($package.Name)"
                 try {
-                    Add-AppxPackage -Path $package.FullName
+                    Add-AppxPackage -Path $package.FullName -ErrorAction Stop
                     Write-Host "     SUCCESS." -ForegroundColor Green
                 } catch {
-                    Write-Error "     FAILED to install $($package.Name). Error: $($_.Exception.Message)"
+                    Write-Host "     FAILED to install $($package.Name). Error: $($_.Exception.Message)" -ForegroundColor Red
+                    $pauseAtEnd = $true
                 }
+            }
+        }
+
+        # Then install any other dependencies whose names don't start with one of the names above, so a new dependency isn't skipped
+        $otherDependencies = $dependencyFiles | Where-Object { $dependency = $_; -not ($dependencyInstallOrder | Where-Object { $dependency.Name -like "$_*" }) } | Sort-Object Name
+        foreach ($package in $otherDependencies) {
+            Write-Host "  -> Installing $($package.Name)"
+            try {
+                Add-AppxPackage -Path $package.FullName -ErrorAction Stop
+                Write-Host "     SUCCESS." -ForegroundColor Green
+            } catch {
+                Write-Host "     FAILED to install $($package.Name). Error: $($_.Exception.Message)" -ForegroundColor Red
+                $pauseAtEnd = $true
             }
         }
 
@@ -546,20 +584,23 @@ try {
             Write-Host "Installing the main application..."
             Write-Host "  -> Installing $($storePackageFile.Name)"
             try {
-                Add-AppxPackage -Path $storePackageFile.FullName
+                Add-AppxPackage -Path $storePackageFile.FullName -ErrorAction Stop
                 Write-Host "     SUCCESS: Microsoft Store has been installed/updated." -ForegroundColor Green
             } catch {
-                Write-Error "     FAILED to install $($storePackageFile.Name). Error: $($_.Exception.Message)"
+                Write-Host "     FAILED to install $($storePackageFile.Name). Error: $($_.Exception.Message)" -ForegroundColor Red
+                $pauseAtEnd = $true
             }
         } else {
             Write-Warning "Microsoft Store package was not found in the download folder."
+            $pauseAtEnd = $true
         }
 
         Write-Host "------------------------------------------------------------"
         Write-Host "Installation process finished." -ForegroundColor Cyan
 
     } catch {
-        Write-Error "A critical error occurred during the installation phase: $($_.Exception.Message)"
+        Write-Host "A critical error occurred during the installation phase: $($_.Exception.Message)" -ForegroundColor Red
+        $pauseAtEnd = $true
     }
     
     # --- Set Region to US so the store will work. Default 'World' region does not work. ---
@@ -571,26 +612,34 @@ try {
         # The -Force switch ensures that parent keys ('International') are also created if they are missing.
         if (-not (Test-Path $geoKeyPath)) {
             Write-Host "  -> Registry key not found. Creating: $geoKeyPath"
-            New-Item -Path $geoKeyPath -Force | Out-Null
+            New-Item -Path $geoKeyPath -Force -ErrorAction Stop | Out-Null
         }
 
-        # Set the 'Nation' value. This is equivalent to: reg add ... /v Nation ...
-        Set-ItemProperty -Path $geoKeyPath -Name "Nation" -Value "244"
-        Write-Host "  -> Set 'Nation' value to '244'."
+        # Only change the region if it isn't set or is still the default 'World' (39070), so a region the user chose is left alone
+        $currentNation = (Get-ItemProperty -Path $geoKeyPath -Name "Nation" -ErrorAction SilentlyContinue).Nation
+        if ($currentNation -and $currentNation -ne "39070") {
+            Write-Host "  -> Region is already set (Nation = '$currentNation'), so it was left unchanged."
+        } else {
+            # Set the 'Nation' value. This is equivalent to: reg add ... /v Nation ...
+            Set-ItemProperty -Path $geoKeyPath -Name "Nation" -Value "244" -ErrorAction Stop
+            Write-Host "  -> Set 'Nation' value to '244'."
 
-        # Set the 'Name' value. This is equivalent to: reg add ... /v Name ...
-        Set-ItemProperty -Path $geoKeyPath -Name "Name" -Value "US"
-        Write-Host "  -> Set 'Name' value to 'US'."
+            # Set the 'Name' value. This is equivalent to: reg add ... /v Name ...
+            Set-ItemProperty -Path $geoKeyPath -Name "Name" -Value "US" -ErrorAction Stop
+            Write-Host "  -> Set 'Name' value to 'US'."
 
-        Write-Host "  -> Registry configuration complete." -ForegroundColor Green
+            Write-Host "  -> Registry configuration complete." -ForegroundColor Green
+        }
     }
     catch {
-        Write-Error "FAILED to configure registry settings. Error: $($_.Exception.Message)"
+        Write-Host "FAILED to configure registry settings. Error: $($_.Exception.Message)" -ForegroundColor Red
+        $pauseAtEnd = $true
     }
     
 
 } catch {
     Write-Host "An error occurred:" -ForegroundColor Red
+    $pauseAtEnd = $true
     if ($_.Exception.Response) {
         $statusCode = $_.Exception.Response.StatusCode.value__
         $statusDescription = $_.Exception.Response.StatusDescription
@@ -599,20 +648,22 @@ try {
             $stream = $_.Exception.Response.GetResponseStream()
             $reader = New-Object System.IO.StreamReader($stream)
             If ($debugSaveFiles) { $reader.ReadToEnd() | Set-Content -Path $errorLogPath }
-        } catch { "Could not read error response body." | Set-Content -Path $errorLogPath }
+        } catch { If ($debugSaveFiles) { "Could not read error response body." | Set-Content -Path $errorLogPath } }
         Write-Host "Status Code: $statusCode"
         Write-Host "Status Description: $statusDescription"
-        Write-Host "Server Response saved to '$errorLogPath'"
+        If ($debugSaveFiles) { Write-Host "Server Response saved to '$errorLogPath'" }
     } else {
         Write-Host $_.Exception.ToString()
     }
-}
+} finally {
+    # This also runs when the script exits early with 'return', so these messages and the pause aren't skipped
+    if ($updateDetected) {
+        Write-Host "`nACTION REQUIRED: Newer file versions are available." -ForegroundColor Yellow
+        if (-not $useExistingFiles -and -not $noDownload) { Write-Host "The newer files were downloaded to: $workingDir" -ForegroundColor Yellow }
+        Write-Host "Please update your cache at: $ExistingInstallerFilesPath" -ForegroundColor Yellow
+    }
 
-if ($updateDetected) {
-    Write-Host "`nACTION REQUIRED: Newer file versions were downloaded." -ForegroundColor Yellow
-    Write-Host "Please update your cache at: $ExistingInstallerFilesPath" -ForegroundColor Yellow
-}
-
-if ($pauseAtEnd) {
-    Read-Host "`nPress Enter to exit"
+    if ($pauseAtEnd) {
+        Read-Host "`nPress Enter to exit"
+    }
 }
