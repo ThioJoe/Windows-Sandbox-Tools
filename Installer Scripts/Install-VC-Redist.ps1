@@ -40,11 +40,11 @@ if ($ForceCachedFilesOnly -and [string]::IsNullOrWhiteSpace($ExistingInstallerFi
 
 # URLs for the latest Visual C++ Redistributables
 $urls = @(
-    "https://aka.ms/vs/17/release/vc_redist.x86.exe",
-    "https://aka.ms/vs/17/release/vc_redist.x64.exe"
+    "https://aka.ms/vc14/vc_redist.x86.exe",
+    "https://aka.ms/vc14/vc_redist.x64.exe"
 )
 if ($env:PROCESSOR_ARCHITECTURE -eq 'ARM64') {
-    $urls += "https://aka.ms/vs/17/release/vc_redist.arm64.exe"
+    $urls += "https://aka.ms/vc14/vc_redist.arm64.exe"
 }
 
 # Directory to save the downloads. This will save it into the user "Downloads" folder.
