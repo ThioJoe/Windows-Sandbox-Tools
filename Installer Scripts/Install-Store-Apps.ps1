@@ -89,6 +89,9 @@ param(
 # Hide PowerShell's progress bars for the whole script. Drawing them slows down downloads a lot, and makes app installs take about a third longer.
 $ProgressPreference = 'SilentlyContinue'
 
+# Windows PowerShell 5.1 only opens 2 connections to the same server at a time by default, so the requests and downloads this script sends at the same time would wait for each other. PowerShell 7 doesn't have that limit.
+[System.Net.ServicePointManager]::DefaultConnectionLimit = [Math]::Max([System.Net.ServicePointManager]::DefaultConnectionLimit, 16)
+
 # Validate parameter combinations
 if ($NoCheckLatestVersion) {
     $ForceCachedFilesOnly = [switch]::new($true)
@@ -253,10 +256,28 @@ function Get-CatalogSearchPage([string]$searchText, [int]$pageIndex) {
     }
 }
 
+# Sends the request for one catalog update's download links with HttpClient, without waiting for the response. Pass what this returns to Get-CatalogDownloadLinks.
+#   This lets the requests for several updates be sent at once, so the waits for the server overlap instead of happening one after another.
+function Start-CatalogDownloadLinksRequest($httpClient, [string]$updateId) {
+    $dialogBody = "updateIDs=" + [uri]::EscapeDataString("[{`"size`":0,`"updateID`":`"$updateId`",`"uidInfo`":`"$updateId`"}]")
+    $requestContent = New-Object System.Net.Http.StringContent($dialogBody, [System.Text.Encoding]::UTF8, "application/x-www-form-urlencoded")
+    return $httpClient.PostAsync("https://www.catalog.update.microsoft.com/DownloadDialog.aspx", $requestContent)
+}
+
 # Gets the download links for one catalog update, the same way the Download button on the catalog website does
-function Get-CatalogDownloadLinks([string]$updateId) {
-    $dialogBody = @{ updateIDs = "[{`"size`":0,`"updateID`":`"$updateId`",`"uidInfo`":`"$updateId`"}]" }
-    $dialogHtml = (Invoke-WebRequest -Uri "https://www.catalog.update.microsoft.com/DownloadDialog.aspx" -Method Post -Body $dialogBody -UseBasicParsing -ErrorAction Stop).Content
+#   If a request from Start-CatalogDownloadLinksRequest is given, the links are read from its response. If there isn't one, or it failed, the links are requested here.
+function Get-CatalogDownloadLinks([string]$updateId, $sentRequest) {
+    $dialogHtml = $null
+    if ($sentRequest) {
+        try {
+            $dialogResponse = $sentRequest.GetAwaiter().GetResult()
+            if ($dialogResponse.IsSuccessStatusCode) { $dialogHtml = $dialogResponse.Content.ReadAsStringAsync().GetAwaiter().GetResult() }
+        } catch {}
+    }
+    if (-not $dialogHtml) {
+        $dialogBody = @{ updateIDs = "[{`"size`":0,`"updateID`":`"$updateId`",`"uidInfo`":`"$updateId`"}]" }
+        $dialogHtml = (Invoke-WebRequest -Uri "https://www.catalog.update.microsoft.com/DownloadDialog.aspx" -Method Post -Body $dialogBody -UseBasicParsing -ErrorAction Stop).Content
+    }
     [regex]::Matches($dialogHtml, "https?://(?:[a-z0-9.-]+\.)?(?:download\.windowsupdate\.com|delivery\.mp\.microsoft\.com)/[^'`"\s]+") | ForEach-Object { $_.Value } | Select-Object -Unique
 }
 
@@ -365,12 +386,23 @@ function Invoke-CatalogSearch([string]$searchText) {
             continue
         }
 
+        # Send the requests for all the chosen updates' links at once. If HttpClient can't be used, each update's links are requested one at a time below.
+        $linkRequests = @{}
+        $catalogClient = $null
+        try {
+            Add-Type -AssemblyName System.Net.Http
+            $catalogClient = New-Object System.Net.Http.HttpClient
+            foreach ($number in $numbers) {
+                $linkRequests[$number] = Start-CatalogDownloadLinksRequest $catalogClient $allResults[$number - 1].UpdateId
+            }
+        } catch {}
+
         Write-Host ""
         foreach ($number in $numbers) {
             $result = $allResults[$number - 1]
             Write-Host ("{0,5}) {1}" -f $number, $result.Title) -ForegroundColor Green
             try {
-                $downloadUrls = @(Get-CatalogDownloadLinks $result.UpdateId)
+                $downloadUrls = @(Get-CatalogDownloadLinks $result.UpdateId $linkRequests[$number])
                 if ($downloadUrls.Count -eq 0) {
                     Write-Host "       No download links were found for this update." -ForegroundColor Yellow
                 }
@@ -379,6 +411,7 @@ function Invoke-CatalogSearch([string]$searchText) {
                 Write-Host "       Could not get the download links. Error: $($_.Exception.Message)" -ForegroundColor Yellow
             }
         }
+        if ($catalogClient) { $catalogClient.Dispose() }
     }
 }
 
@@ -862,6 +895,7 @@ $fileListXmlTemplate = @"
 "@
 
 # Step 3: GetExtendedUpdateInfo2 - After getting the list of matched files (app version and dependencies), this lets us get the actual download URLs
+#   {1} is an <UpdateIdentity> element for each package to get the URL of. One request can list many packages.
 # See: https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-wusp/2f66a682-164f-47ec-968e-e43c0a85dc21
 $fileUrlXmlTemplate = @"
 <s:Envelope xmlns:s="http://www.w3.org/2003/05/soap-envelope" xmlns:a="http://www.w3.org/2005/08/addressing">
@@ -871,8 +905,8 @@ $fileUrlXmlTemplate = @"
         <a:To s:mustUnderstand="1">https://fe3cr.delivery.mp.microsoft.com/ClientWebService/client.asmx/secured</a:To>
         <o:Security s:mustUnderstand="1" xmlns:o="http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-wssecurity-secext-1.0.xsd">
             <u:Timestamp u:Id="_0" xmlns:u="http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-wssecurity-utility-1.0.xsd">
-                <u:Created>{6}</u:Created>
-                <u:Expires>{7}</u:Expires>
+                <u:Created>{5}</u:Created>
+                <u:Expires>{6}</u:Expires>
             </u:Timestamp>
             <wuws:WindowsUpdateTicketsToken wsu:id="ClientMSA" xmlns:wsu="http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-wssecurity-utility-1.0.xsd" xmlns:wuws="http://schemas.microsoft.com/msus/2014/10/WindowsUpdateAuthorization">
                 <TicketType Name="MSA" Version="1.0" Policy="MBI_SSL"><user>{0}</user></TicketType>
@@ -881,9 +915,9 @@ $fileUrlXmlTemplate = @"
     </s:Header>
     <s:Body>
         <GetExtendedUpdateInfo2 xmlns="http://www.microsoft.com/SoftwareDistribution/Server/ClientWebService">
-            <updateIDs><UpdateIdentity><UpdateID>{1}</UpdateID><RevisionNumber>{2}</RevisionNumber></UpdateIdentity></updateIDs>
+            <updateIDs>{1}</updateIDs>
             <infoTypes><XmlUpdateFragmentType>FileUrl</XmlUpdateFragmentType></infoTypes>
-            <deviceAttributes>E:BranchReadinessLevel=CB&amp;CurrentBranch={3}&amp;OEMModel=Virtual%20Machine&amp;FlightRing={4}&amp;AttrDataVer=321&amp;InstallLanguage=en-US&amp;OSUILocale=en-US&amp;InstallationType=Client&amp;FlightingBranchName={5}&amp;OSSkuId=48&amp;App=WU_STORE&amp;ProcessorManufacturer=GenuineIntel&amp;OEMName_Uncleaned=Microsoft%20Corporation&amp;AppVer=1407.2503.28012.0&amp;OSArchitecture=AMD64&amp;IsFlightingEnabled=1&amp;TelemetryLevel=1&amp;DefaultUserRegion=39070&amp;WuClientVer=1310.2503.26012.0&amp;OSVersion=10.0.$osBuildNumber.0&amp;DeviceFamily=Windows.Desktop</deviceAttributes>
+            <deviceAttributes>E:BranchReadinessLevel=CB&amp;CurrentBranch={2}&amp;OEMModel=Virtual%20Machine&amp;FlightRing={3}&amp;AttrDataVer=321&amp;InstallLanguage=en-US&amp;OSUILocale=en-US&amp;InstallationType=Client&amp;FlightingBranchName={4}&amp;OSSkuId=48&amp;App=WU_STORE&amp;ProcessorManufacturer=GenuineIntel&amp;OEMName_Uncleaned=Microsoft%20Corporation&amp;AppVer=1407.2503.28012.0&amp;OSArchitecture=AMD64&amp;IsFlightingEnabled=1&amp;TelemetryLevel=1&amp;DefaultUserRegion=39070&amp;WuClientVer=1310.2503.26012.0&amp;OSVersion=10.0.$osBuildNumber.0&amp;DeviceFamily=Windows.Desktop</deviceAttributes>
         </GetExtendedUpdateInfo2>
     </s:Body>
 </s:Envelope>
@@ -1268,19 +1302,47 @@ try {
                 $originalPref = $ProgressPreference
                 $ProgressPreference = 'SilentlyContinue'
 
-                foreach ($package in $packagesToDownload) {
-                    Write-Host "Processing: $($package.FullName)"
-
-                    # Get the download URL for this specific package
+                # Gets the download URLs for packages from the same channel with one request, and adds them to $urlTable with each package's full name as the key
+                #   A package the server has no URL for gets an empty value, so it isn't requested again.
+                function Get-PackageDownloadUrls($packages, $urlTable) {
+                    $updateIdentities = ($packages | ForEach-Object { "<UpdateIdentity><UpdateID>$($_.UpdateID)</UpdateID><RevisionNumber>$($_.RevisionNumber)</RevisionNumber></UpdateIdentity>" }) -join ''
                     # The timestamps are generated for each request, because values written directly in the template are fixed when the script starts and expire 5 minutes later
                     $requestTime = (Get-Date).ToUniversalTime()
-                    $fileUrlRequestPayload = $fileUrlXmlTemplate -f $encryptedCookieData, $package.UpdateID, $package.RevisionNumber, $currentBranch, $package.FlightRing, $package.FlightingBranchName, $requestTime.ToString("yyyy-MM-dd'T'HH:mm:ss.fff'Z'"), $requestTime.AddMinutes(5).ToString("yyyy-MM-dd'T'HH:mm:ss.fff'Z'")
+                    $fileUrlRequestPayload = $fileUrlXmlTemplate -f $encryptedCookieData, $updateIdentities, $currentBranch, $packages[0].FlightRing, $packages[0].FlightingBranchName, $requestTime.ToString("yyyy-MM-dd'T'HH:mm:ss.fff'Z'"), $requestTime.AddMinutes(5).ToString("yyyy-MM-dd'T'HH:mm:ss.fff'Z'")
                     $fileUrlResponse = Invoke-WebRequest -Uri "$baseUri/secured" -Method Post -Body $fileUrlRequestPayload -Headers $headers -UseBasicParsing
                     $fileUrlResponseXml = [xml]$fileUrlResponse.Content
 
+                    # The response has the file URLs for all the packages, along with other files such as block maps. Each package's URL contains its file name, which is a GUID.
                     $fileLocations = $fileUrlResponseXml.Envelope.Body.GetExtendedUpdateInfo2Response.GetExtendedUpdateInfo2Result.FileLocations.FileLocation
-                    $baseFileName = [System.IO.Path]::GetFileNameWithoutExtension($package.FileName)
-                    $downloadUrl = ($fileLocations | Where-Object { $_.Url -like "*$baseFileName*" }).Url
+                    foreach ($package in $packages) {
+                        $baseFileName = [System.IO.Path]::GetFileNameWithoutExtension($package.FileName)
+                        $urlTable[$package.FullName] = ($fileLocations | Where-Object { $_.Url -like "*$baseFileName*" } | Select-Object -First 1).Url
+                    }
+                }
+
+                # Get the download URLs for all the packages with one request per channel, instead of one request per package, which took about a second each.
+                #   The packages are grouped by channel because the request includes the channel's flight ring. The server accepts up to 50 packages in one request.
+                #   If a request fails, the URLs of its packages are requested one at a time below.
+                $downloadUrls = @{}
+                foreach ($channelGroup in @($packagesToDownload | Group-Object -Property FlightRing, FlightingBranchName)) {
+                    for ($start = 0; $start -lt $channelGroup.Count; $start += 50) {
+                        try {
+                            Get-PackageDownloadUrls @($channelGroup.Group | Select-Object -Skip $start -First 50) $downloadUrls
+                        } catch {
+                            Write-Host "  -> Could not get the download URLs with one request, so they'll be requested one at a time. Error: $($_.Exception.Message)" -ForegroundColor Yellow
+                        }
+                    }
+                }
+
+                $downloads = @()
+                foreach ($package in $packagesToDownload) {
+                    Write-Host "Processing: $($package.FullName)"
+
+                    # Get the download URL for this specific package, if the request above failed
+                    if (-not $downloadUrls.ContainsKey($package.FullName)) {
+                        Get-PackageDownloadUrls @($package) $downloadUrls
+                    }
+                    $downloadUrl = $downloadUrls[$package.FullName]
 
                     if (-not $downloadUrl) {
                         Write-Warning "  -> Could not retrieve download URL for $($package.FileName). Skipping."
@@ -1299,15 +1361,82 @@ try {
 
                     Write-Host "  -> Downloading from: $downloadUrl" -ForegroundColor Gray
                     Write-Host "  -> Saving to: $filePath"
-
-                    try {
-                        Invoke-WebRequest -Uri $downloadUrl -OutFile $filePath -UseBasicParsing
-                        Write-Host "  -> SUCCESS: Download complete." -ForegroundColor Green
-                    } catch {
-                        Write-Host "  -> FAILED to download $($newFileName). Error: $($_.Exception.Message)" -ForegroundColor Red
-                        $pauseAtEnd = $true
-                    }
                     Write-Host ""
+                    $downloads += [PSCustomObject]@{ FileName = $newFileName; FilePath = $filePath; Url = $downloadUrl; ResponseTask = $null; Response = $null; FileStream = $null; CopyTask = $null; Finished = $false; Error = $null }
+                }
+
+                # Download all the files at the same time with HttpClient instead of one after another, so the waits for each file to start overlap, and the total speed isn't limited to what one connection gets.
+                #   Each file is written to the disk as it arrives. Any file that fails is downloaded again afterward with Invoke-WebRequest, one at a time.
+                if ($downloads.Count -gt 0) {
+                    Write-Host "Downloading $($downloads.Count) file(s) at the same time..."
+                    $downloadTimer = [System.Diagnostics.Stopwatch]::StartNew()
+                    $downloadClient = $null
+                    try {
+                        $downloadClient = New-Object System.Net.Http.HttpClient
+                        # Send all the requests first. Each request's task finishes when the server starts sending that file.
+                        foreach ($download in $downloads) {
+                            $download.ResponseTask = $downloadClient.GetAsync($download.Url, [System.Net.Http.HttpCompletionOption]::ResponseHeadersRead)
+                        }
+                        # Then start writing each file to the disk as its data arrives
+                        foreach ($download in $downloads) {
+                            try {
+                                $download.Response = $download.ResponseTask.GetAwaiter().GetResult()
+                                $download.Response.EnsureSuccessStatusCode() | Out-Null
+                                $download.FileStream = [System.IO.File]::Create($ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($download.FilePath))
+                                $download.CopyTask = $download.Response.Content.CopyToAsync($download.FileStream)
+                            } catch {
+                                $download.Error = $_.Exception.GetBaseException().Message
+                            }
+                        }
+                        # Report each file as it finishes. The wait is checked twice a second so that Ctrl+C still works.
+                        $activeDownloads = @($downloads | Where-Object { $_.CopyTask })
+                        while ($activeDownloads.Count -gt 0) {
+                            $finishedIndex = [System.Threading.Tasks.Task]::WaitAny([System.Threading.Tasks.Task[]]@($activeDownloads | ForEach-Object { $_.CopyTask }), 500)
+                            if ($finishedIndex -lt 0) { continue }
+                            $download = $activeDownloads[$finishedIndex]
+                            $activeDownloads = @($activeDownloads | Where-Object { $_ -ne $download })
+                            try {
+                                $null = $download.CopyTask.GetAwaiter().GetResult()
+                                $download.FileStream.Dispose()
+                                # Make sure the whole file arrived, in case the connection was closed early without an error
+                                $fileLength = (Get-Item -LiteralPath $download.FilePath).Length
+                                $expectedLength = $download.Response.Content.Headers.ContentLength
+                                if ($null -ne $expectedLength -and $fileLength -ne $expectedLength) {
+                                    throw "Only $fileLength of the file's $expectedLength bytes were received."
+                                }
+                                $download.Finished = $true
+                                Write-Host "  -> SUCCESS: Downloaded $($download.FileName) ($('{0:N1}' -f ($fileLength / 1MB)) MB)" -ForegroundColor Green
+                            } catch {
+                                $download.Error = $_.Exception.GetBaseException().Message
+                            }
+                        }
+                    } catch {
+                        # If HttpClient couldn't be used at all, the files that didn't finish are downloaded below with Invoke-WebRequest
+                        foreach ($download in $downloads) { if (-not $download.Error) { $download.Error = $_.Exception.GetBaseException().Message } }
+                    } finally {
+                        foreach ($download in $downloads) {
+                            if ($download.FileStream) { $download.FileStream.Dispose() }
+                            if ($download.Response) { $download.Response.Dispose() }
+                        }
+                        if ($downloadClient) { $downloadClient.Dispose() }
+                    }
+
+                    # Download any files that didn't finish again, one at a time with Invoke-WebRequest
+                    foreach ($download in @($downloads | Where-Object { -not $_.Finished })) {
+                        Write-Host "  -> Downloading $($download.FileName) didn't work, so trying again with Invoke-WebRequest. Error: $($download.Error)" -ForegroundColor Yellow
+                        try {
+                            Invoke-WebRequest -Uri $download.Url -OutFile $download.FilePath -UseBasicParsing
+                            $download.Finished = $true
+                            Write-Host "  -> SUCCESS: Downloaded $($download.FileName)" -ForegroundColor Green
+                        } catch {
+                            Write-Host "  -> FAILED to download $($download.FileName). Error: $($_.Exception.Message)" -ForegroundColor Red
+                            $pauseAtEnd = $true
+                        }
+                    }
+
+                    $finishedDownloads = @($downloads | Where-Object { $_.Finished })
+                    $downloadedBytes = ($finishedDownloads | ForEach-Object { (Get-Item -LiteralPath $_.FilePath).Length } | Measure-Object -Sum).Sum
+                    Write-Host "Downloaded $($finishedDownloads.Count) of $($downloads.Count) file(s), $('{0:N1}' -f ($downloadedBytes / 1MB)) MB in total, in $('{0:N1}' -f $downloadTimer.Elapsed.TotalSeconds) seconds." -ForegroundColor Gray
                 }
 
                 $ProgressPreference = $originalPref
