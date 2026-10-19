@@ -1,4 +1,4 @@
-# Scripts & Tools for Windows Sandbox
+# Thio's Scripts & Tools for Windows Sandbox
 Various useful scripts for use within Windows Sandbox
 
 ## 📥 Installer Scripts
