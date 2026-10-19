@@ -987,6 +987,7 @@ try {
                 FileName         = $fileName
                 UpdateID         = $updateGuid
                 RevisionNumber   = $revNum
+                PackageRank      = $update.Xml.Properties.PackageRank -as [int]
                 SupportsThisOS   = (Test-PackageSupportsThisWindows $applicabilityBlob)
             }
 
@@ -1038,12 +1039,14 @@ try {
                 Write-Host "  -> Skipped $skippedCount package version(s) that are for other devices or need a newer version of Windows." -ForegroundColor Yellow
             }
 
-            # 2. Find the latest version of the main app's package
+            # 2. Find the main app's package to install: the one with the highest PackageRank. The rank is the Store's own order of preference for the app's packages.
+            #    The highest version number isn't always the newest build, because some apps restarted their version numbers. For example, Phone Link's old builds are 2021.x and its current ones are 1.26.x, and Media Player's old Groove Music builds are 2019.x while its current ones are 11.x.
+            #    The version number is only used to break a tie between equal ranks.
             $latestMainPackage = $null
             if ($mainPackageName) {
                 $latestMainPackage = $usablePackages |
                     Where-Object { $_.PackageName -eq $mainPackageName } |
-                    Sort-Object { $_.Version -as [version] } -Descending |
+                    Sort-Object { $_.PackageRank }, { $_.Version -as [version] } -Descending |
                     Select-Object -First 1
             }
 
