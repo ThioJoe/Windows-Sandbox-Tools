@@ -6,10 +6,15 @@ Various useful scripts for use within Windows Sandbox
 PowerShell scripts that can install apps or components not normally included in the Sandbox
 
 - `Install-Winget.ps1`: Fetches necessary files and dependencies from Microsoft's [winget-cli](https://github.com/microsoft/winget-cli) repo, and installs it
+- `Install VC Redist.ps1`: Installs the latest Microsoft Visual C++ Redistributables, which are commonly required by other software.
 - `Install-Microsoft-Store.ps1`: Installs the Microsoft Store via the Windows Update APIs
   - Unlike other similar scripts, mine does NOT use any third party APIs like UUP Dump or RG-Adguard at all
   - (All web requests go directly to Microsoft servers. Even those fetching the download URLs in the first place)
-- `Install VC Redist.ps1`: Installs the latest Microsoft Visual C++ Redistributables, which are commonly required by other software.
+- `Install-Store-Apps.ps1`: Search, download, and install apps from the Microsoft Store, without the MS Store needing to be installed
+  - Can also search the Microsoft Update Catalog.
+  - Uses the Windows Update APIs with NO third party APIs. All requests go directly to Microsoft servers.
+  - Can be run with parameters to auto install a specific app. Run without parameters to use interactively.
+  - Note: Apps with their own installer (IDs starting with XP) can't be fetched this way.
 
 ## 🛠️ General Scripts
 
