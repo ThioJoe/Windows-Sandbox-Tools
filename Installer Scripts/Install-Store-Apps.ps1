@@ -19,6 +19,9 @@ param(
     # Optional package name of the main app, such as "Microsoft.WindowsStore". It's normally found automatically, so this is only needed if that fails.
     [string]$MainPackageName,
 
+    # Optional exact version of the main app to download/install. Without it, interactive mode offers a version menu when multiple versions exist.
+    [string]$AppVersion,
+
     # Optional wildcard filter for package names, such as "Microsoft.VCLibs*". Only matching packages are downloaded and installed.
     [string]$NameFilter,
 
@@ -639,6 +642,13 @@ if (-not $ProductId -and -not $CategoryId -and -not $NoCheckLatestVersion) {
 $flightRing = "Retail"             # Apparently accepts 'Retail', 'Internal', and 'External'
 $flightingBranchName = ""          # Empty ( "" ) for normal release. Otherwise apparent possible values: Dev, Beta, ReleasePreview, MSIT, CanaryChannel, external
 
+# Query the stable Retail channel first, then the Windows Insider Dev channel. Some apps won't have Insider packages available.
+#   'External' with 'Dev' is what Insider PCs in the Dev channel (now called Experimental) send. The older 'WIF' value, which store.rg-adguard.net's 'Fast' option uses, only still works for a few apps.
+$packageChannels = @(
+    [PSCustomObject]@{ Name = 'Retail'; FlightRing = $flightRing; FlightingBranchName = $flightingBranchName }
+    [PSCustomObject]@{ Name = 'Insider'; FlightRing = 'External'; FlightingBranchName = 'Dev' }
+)
+
 $osBuildNumber = [Environment]::OSVersion.Version.Build
 if ($osBuildNumber -ge 26100) {
     $currentBranch = "ge_release"
@@ -910,108 +920,143 @@ try {
         Write-Host "Success. Cookie received." -ForegroundColor Green
 
         # Step 2: Get File List
-        Write-Host "Step 2: Getting file list..."
-        $fileListRequestPayload = $fileListXmlTemplate -f $encryptedCookieData, $targetCategoryId, $currentBranch, $flightRing, $flightingBranchName
-        If ($debugSaveFiles) { [System.IO.File]::WriteAllText((Join-Path $debugDir "02_Step2_Request_AUTOMATED.xml"), $fileListRequestPayload, [System.Text.UTF8Encoding]::new($false)) }
-
-        $fileListResponse = Invoke-WebRequest -Uri $baseUri -Method Post -Body $fileListRequestPayload -Headers $headers -UseBasicParsing
-        If ($debugSaveFiles) { $fileListResponse.Content | Set-Content -Path (Join-Path $debugDir "02_Step2_Response_SUCCESS.xml") }
-
-        # The response contains XML fragments that are HTML-encoded. We must decode this before treating it as XML.
-        $decodedContent = [System.Net.WebUtility]::HtmlDecode($fileListResponse.Content)
-        $fileListResponseXml = [xml]$decodedContent
-        Write-Host "Successfully received and DECODED Step 2 response." -ForegroundColor Green
-
+        Write-Host "Step 2: Getting file lists from Retail and Insider channels..."
         $fileIdentityMap = @{}
 
-        # Get the two main lists of updates from the now correctly-decoded response
-        $newUpdates = $fileListResponseXml.Envelope.Body.SyncUpdatesResponse.SyncUpdatesResult.NewUpdates.UpdateInfo
-        $allExtendedUpdates = $fileListResponseXml.Envelope.Body.SyncUpdatesResponse.SyncUpdatesResult.ExtendedUpdateInfo.Updates.Update
+        # Send the requests for all channels at once, so the waits for the server overlap instead of happening one after another. Each response is then handled in order below.
+        Add-Type -AssemblyName System.Net.Http
+        $httpClient = New-Object System.Net.Http.HttpClient
+        $channelRequests = @{}
+        foreach ($channel in $packageChannels) {
+            Write-Host "  -> Querying $($channel.Name) channel..." -ForegroundColor Gray
+            $fileListRequestPayload = $fileListXmlTemplate -f $encryptedCookieData, $targetCategoryId, $currentBranch, $channel.FlightRing, $channel.FlightingBranchName
+            If ($debugSaveFiles) { [System.IO.File]::WriteAllText((Join-Path $debugDir "02_Step2_Request_$($channel.Name).xml"), $fileListRequestPayload, [System.Text.UTF8Encoding]::new($false)) }
+            $requestContent = New-Object System.Net.Http.StringContent($fileListRequestPayload, [System.Text.Encoding]::UTF8, "application/soap+xml")
+            $channelRequests[$channel.Name] = $httpClient.PostAsync($baseUri, $requestContent)
+        }
 
-        # If the main package name isn't known yet, get it from the app's own category entry in the response, which has the app's package family name
-        if (-not $mainPackageName) {
-            $categoryUpdate = $newUpdates | Where-Object { $_.Xml.UpdateIdentity.UpdateID -eq $targetCategoryId } | Select-Object -First 1
-            $mainPackageName = $categoryUpdate.Xml.ApplicabilityRules.Metadata.AppxPackageMetadata.AppxFamilyMetadata.Name
-            if ($mainPackageName) {
-                Write-Host "The main app's package name is '$mainPackageName'." -ForegroundColor Green
-            } else {
-                Write-Warning "Could not tell which package is the main app, so all packages will be treated as dependencies. Use -MainPackageName to specify it."
+        foreach ($channel in $packageChannels) {
+            try {
+                # Wait for this channel's response. If the request failed, GetResult() throws its error.
+                $fileListResponse = $channelRequests[$channel.Name].GetAwaiter().GetResult()
+                $fileListResponseContent = $fileListResponse.Content.ReadAsStringAsync().GetAwaiter().GetResult()
+                If ($debugSaveFiles) { $fileListResponseContent | Set-Content -Path (Join-Path $debugDir "02_Step2_Response_$($channel.Name).xml") }
+                if (-not $fileListResponse.IsSuccessStatusCode) { throw "The server returned HTTP $([int]$fileListResponse.StatusCode) ($($fileListResponse.ReasonPhrase))" }
+
+                # The response contains XML fragments that are HTML-encoded. We must decode this before treating it as XML.
+                $decodedContent = [System.Net.WebUtility]::HtmlDecode($fileListResponseContent)
+                $fileListResponseXml = [xml]$decodedContent
+                Write-Host "  -> Successfully received and decoded $($channel.Name) response." -ForegroundColor Green
+            } catch {
+                if ($channel.Name -eq 'Retail') { throw }
+                Write-Warning "Could not query the $($channel.Name) channel: $($_.Exception.Message). Continuing with Retail packages."
+                continue
             }
+
+            # Get the two main lists of updates from the now correctly-decoded response
+            $newUpdates = $fileListResponseXml.Envelope.Body.SyncUpdatesResponse.SyncUpdatesResult.NewUpdates.UpdateInfo
+            $allExtendedUpdates = $fileListResponseXml.Envelope.Body.SyncUpdatesResponse.SyncUpdatesResult.ExtendedUpdateInfo.Updates.Update
+
+            # If the main package name isn't known yet, get it from the app's own category entry in the response, which has the app's package family name
+            if (-not $mainPackageName) {
+                $categoryUpdate = $newUpdates | Where-Object { $_.Xml.UpdateIdentity.UpdateID -eq $targetCategoryId } | Select-Object -First 1
+                $mainPackageName = $categoryUpdate.Xml.ApplicabilityRules.Metadata.AppxPackageMetadata.AppxFamilyMetadata.Name
+                if ($mainPackageName) {
+                    Write-Host "The main app's package name is '$mainPackageName'." -ForegroundColor Green
+                }
+            }
+
+            Write-Host "--- Correlating $($channel.Name) Update Information ---" -ForegroundColor Cyan
+
+            # Filter the 'NewUpdates' list to only include items that are actual downloadable files.
+            # These are identified by the presence of the <SecuredFragment> tag inside their inner XML.
+            $downloadableUpdates = $newUpdates | Where-Object { $_.Xml.Properties.SecuredFragment }
+
+            Write-Host "Found $(@($downloadableUpdates).Count) potentially downloadable packages in $($channel.Name)." -ForegroundColor Gray
+
+            # Now, process each downloadable update
+            foreach ($update in $downloadableUpdates) {
+                $lookupId = $update.ID
+
+                # Find the matching entry in the 'ExtendedUpdateInfo' list using the same numeric ID. Only the entry with the file list is needed.
+                $extendedInfo = $allExtendedUpdates | Where-Object { ($_.ID -eq $lookupId) -and $_.Xml.Files } | Select-Object -First 1
+
+                if (-not $extendedInfo) {
+                    Write-Warning "Could not find matching ExtendedInfo for downloadable update ID $lookupId. Skipping."
+                    continue
+                }
+
+                # From the extended info, get the actual package file and ignore the metadata .cab files.
+                $fileNode = $extendedInfo.Xml.Files.File | Where-Object { $_.FileName -and $_.FileName -notlike "Abm_*" } | Select-Object -First 1
+
+                if (-not $fileNode) {
+                    Write-Warning "Found matching ExtendedInfo for ID $lookupId, but it contains no valid file node. Skipping."
+                    continue
+                }
+
+                # Additional parsing
+                $fileName = $fileNode.FileName
+                $updateGuid = $update.Xml.UpdateIdentity.UpdateID
+                $revNum = $update.Xml.UpdateIdentity.RevisionNumber
+                $fullIdentifier = $fileNode.GetAttribute("InstallerSpecificIdentifier")
+                $applicabilityBlob = $update.Xml.ApplicabilityRules.Metadata.AppxPackageMetadata.AppxMetadata.ApplicabilityBlob
+
+                # Define the regex based on the official package identity structure.
+                # <Name>_<Version>_<Architecture>_<ResourceId>_<PublisherId>
+                $regex = "^(?<Name>.+?)_(?<Version>\d+\.\d+\.\d+\.\d+)_(?<Architecture>[a-zA-Z0-9]+)_(?<ResourceId>.*?)_(?<PublisherId>[a-hjkmnp-tv-z0-9]{13})$"
+
+                $packageInfo = [PSCustomObject]@{
+                    FullName         = $fullIdentifier
+                    FileName         = $fileName
+                    UpdateID         = $updateGuid
+                    RevisionNumber   = $revNum
+                    PackageRank      = $update.Xml.Properties.PackageRank -as [int]
+                    Ranks            = @{ ($channel.Name) = ($update.Xml.Properties.PackageRank -as [int]) }
+                    SupportsThisOS   = (Test-PackageSupportsThisWindows $applicabilityBlob)
+                    Channel          = $channel.Name
+                    Channels         = @($channel.Name)
+                    FlightRing       = $channel.FlightRing
+                    FlightingBranchName = $channel.FlightingBranchName
+                }
+
+                if ($fullIdentifier -match $regex) {
+                    # If the regex matches, populate the object with the named capture groups
+                    $packageInfo | Add-Member -MemberType NoteProperty -Name "PackageName" -Value $matches.Name
+                    $packageInfo | Add-Member -MemberType NoteProperty -Name "Version" -Value $matches.Version
+                    $packageInfo | Add-Member -MemberType NoteProperty -Name "Architecture" -Value $matches.Architecture
+                    $packageInfo | Add-Member -MemberType NoteProperty -Name "ResourceId" -Value $matches.ResourceId
+                    $packageInfo | Add-Member -MemberType NoteProperty -Name "PublisherId" -Value $matches.PublisherId
+                } else {
+                    # Fallback for any identifiers that don't match the pattern
+                    $packageInfo | Add-Member -MemberType NoteProperty -Name "PackageName" -Value "Unknown (Parsing Failed)"
+                    $packageInfo | Add-Member -MemberType NoteProperty -Name "Architecture" -Value "unknown"
+                }
+
+                # Use the full, unique identifier as the key in the map. Prefer Retail metadata for packages found in both channels, but keep the package's rank from each channel's list, since each list numbers its ranks separately.
+                if ($fileIdentityMap.ContainsKey($fullIdentifier)) {
+                    $existingPackage = $fileIdentityMap[$fullIdentifier]
+                    if ($channel.Name -notin $existingPackage.Channels) { $existingPackage.Channels += $channel.Name }
+                    $existingPackage.Ranks[$channel.Name] = $update.Xml.Properties.PackageRank -as [int]
+                    continue
+                }
+                $fileIdentityMap[$fullIdentifier] = $packageInfo
+
+                Write-Host "  -> CORRELATED: '$($packageInfo.PackageName)' $($packageInfo.Version) ($($packageInfo.Architecture)) [$($channel.Name)]" -ForegroundColor Green
+            }
+        }
+
+        $httpClient.Dispose()
+
+        if (-not $mainPackageName) {
+            Write-Warning "Could not tell which package is the main app, so all packages will be treated as dependencies. Use -MainPackageName to specify it."
         }
         if (-not $workingDir) {
             $folderName = if ($mainPackageName) { $mainPackageName } else { $targetCategoryId }
             $workingDir = Join-Path -Path $userDownloadsFolder -ChildPath "$folderName Install"
         }
 
-        Write-Host "--- Correlating Update Information ---" -ForegroundColor Cyan
-
-        # Filter the 'NewUpdates' list to only include items that are actual downloadable files.
-        # These are identified by the presence of the <SecuredFragment> tag inside their inner XML.
-        $downloadableUpdates = $newUpdates | Where-Object { $_.Xml.Properties.SecuredFragment }
-
-        Write-Host "Found $(@($downloadableUpdates).Count) potentially downloadable packages." -ForegroundColor Gray
-
-        # Now, process each downloadable update
-        foreach ($update in $downloadableUpdates) {
-            $lookupId = $update.ID
-
-            # Find the matching entry in the 'ExtendedUpdateInfo' list using the same numeric ID. Only the entry with the file list is needed.
-            $extendedInfo = $allExtendedUpdates | Where-Object { ($_.ID -eq $lookupId) -and $_.Xml.Files } | Select-Object -First 1
-
-            if (-not $extendedInfo) {
-                Write-Warning "Could not find matching ExtendedInfo for downloadable update ID $lookupId. Skipping."
-                continue
-            }
-
-            # From the extended info, get the actual package file and ignore the metadata .cab files.
-            $fileNode = $extendedInfo.Xml.Files.File | Where-Object { $_.FileName -and $_.FileName -notlike "Abm_*" } | Select-Object -First 1
-
-            if (-not $fileNode) {
-                Write-Warning "Found matching ExtendedInfo for ID $lookupId, but it contains no valid file node. Skipping."
-                continue
-            }
-
-            # Additional parsing
-            $fileName = $fileNode.FileName
-            $updateGuid = $update.Xml.UpdateIdentity.UpdateID
-            $revNum = $update.Xml.UpdateIdentity.RevisionNumber
-            $fullIdentifier = $fileNode.GetAttribute("InstallerSpecificIdentifier")
-            $applicabilityBlob = $update.Xml.ApplicabilityRules.Metadata.AppxPackageMetadata.AppxMetadata.ApplicabilityBlob
-
-            # Define the regex based on the official package identity structure.
-            # <Name>_<Version>_<Architecture>_<ResourceId>_<PublisherId>
-            $regex = "^(?<Name>.+?)_(?<Version>\d+\.\d+\.\d+\.\d+)_(?<Architecture>[a-zA-Z0-9]+)_(?<ResourceId>.*?)_(?<PublisherId>[a-hjkmnp-tv-z0-9]{13})$"
-
-            $packageInfo = [PSCustomObject]@{
-                FullName         = $fullIdentifier
-                FileName         = $fileName
-                UpdateID         = $updateGuid
-                RevisionNumber   = $revNum
-                PackageRank      = $update.Xml.Properties.PackageRank -as [int]
-                SupportsThisOS   = (Test-PackageSupportsThisWindows $applicabilityBlob)
-            }
-
-            if ($fullIdentifier -match $regex) {
-                # If the regex matches, populate the object with the named capture groups
-                $packageInfo | Add-Member -MemberType NoteProperty -Name "PackageName" -Value $matches.Name
-                $packageInfo | Add-Member -MemberType NoteProperty -Name "Version" -Value $matches.Version
-                $packageInfo | Add-Member -MemberType NoteProperty -Name "Architecture" -Value $matches.Architecture
-                $packageInfo | Add-Member -MemberType NoteProperty -Name "ResourceId" -Value $matches.ResourceId
-                $packageInfo | Add-Member -MemberType NoteProperty -Name "PublisherId" -Value $matches.PublisherId
-            } else {
-                # Fallback for any identifiers that don't match the pattern
-                $packageInfo | Add-Member -MemberType NoteProperty -Name "PackageName" -Value "Unknown (Parsing Failed)"
-                $packageInfo | Add-Member -MemberType NoteProperty -Name "Architecture" -Value "unknown"
-            }
-
-            # Use the full, unique identifier as the key in the map
-            $fileIdentityMap[$fullIdentifier] = $packageInfo
-
-            Write-Host "  -> CORRELATED: '$($packageInfo.PackageName)' $($packageInfo.Version) ($($packageInfo.Architecture))" -ForegroundColor Green
-        }
-
         Write-Host "--- Correlation Complete ---" -ForegroundColor Cyan
-        Write-Host "Found and prepared $($fileIdentityMap.Count) downloadable files." -ForegroundColor Green
+        Write-Host "Found and prepared $($fileIdentityMap.Count) downloadable files across both channels." -ForegroundColor Green
 
 
         # --- Step 3: Filter, Get URLs, and Download ---
@@ -1043,24 +1088,113 @@ try {
             #    The highest version number isn't always the newest build, because some apps restarted their version numbers. For example, Phone Link's old builds are 2021.x and its current ones are 1.26.x, and Media Player's old Groove Music builds are 2019.x while its current ones are 11.x.
             #    The version number is only used to break a tie between equal ranks.
             $latestMainPackage = $null
+            $selectedAppVersion = $null
+            $quitAtVersionMenu = $false
             if ($mainPackageName) {
-                $latestMainPackage = $usablePackages |
-                    Where-Object { $_.PackageName -eq $mainPackageName } |
-                    Sort-Object { $_.PackageRank }, { $_.Version -as [version] } -Descending |
-                    Select-Object -First 1
+                $mainPackages = @($usablePackages | Where-Object { $_.PackageName -eq $mainPackageName })
+                # Ranks from different channels' lists can't be compared with each other, so the latest of each channel is found with that channel's own ranks
+                $latestRetail = $mainPackages | Where-Object { $_.Channels -contains 'Retail' } |
+                    Sort-Object { $_.Ranks['Retail'] }, { $_.Version -as [version] } -Descending | Select-Object -First 1
+                $latestInsider = $mainPackages | Where-Object { $_.Channels -contains 'Insider' } |
+                    Sort-Object { $_.Ranks['Insider'] }, { $_.Version -as [version] } -Descending | Select-Object -First 1
+
+                # Present one entry per version; prefer the Retail package when the same version occurs in both channels.
+                $mainPackageVersions = @($mainPackages | Group-Object Version | ForEach-Object {
+                    $preferredPackage = $_.Group | Where-Object { $_.Channels -contains 'Retail' } |
+                        Sort-Object { $_.Ranks['Retail'] }, { $_.Version -as [version] } -Descending | Select-Object -First 1
+                    if (-not $preferredPackage) {
+                        $preferredPackage = $_.Group | Sort-Object { $_.Ranks['Insider'] }, { $_.Version -as [version] } -Descending | Select-Object -First 1
+                    }
+                    $preferredPackage
+                })
+                # List the Retail versions in order of their Retail rank, then the Insider-only versions in order of their Insider rank
+                $versionOptions = @($mainPackageVersions | Where-Object { $_.Channels -contains 'Retail' } | Sort-Object { $_.Ranks['Retail'] }, { $_.Version -as [version] } -Descending) +
+                    @($mainPackageVersions | Where-Object { $_.Channels -notcontains 'Retail' } | Sort-Object { $_.Ranks['Insider'] }, { $_.Version -as [version] } -Descending)
+
+                # Always put the newest stable release first, followed by the newest Insider release if it's a different version.
+                if ($latestRetail) {
+                    $versionOptions = @($versionOptions | Where-Object { $_.Version -eq $latestRetail.Version }) + @($versionOptions | Where-Object { $_.Version -ne $latestRetail.Version })
+                }
+                if ($latestInsider -and $latestInsider.Version -ne $latestRetail.Version) {
+                    $versionOptions = @($versionOptions | Where-Object { $_.Version -eq $latestRetail.Version }) +
+                        @($versionOptions | Where-Object { $_.Version -eq $latestInsider.Version }) +
+                        @($versionOptions | Where-Object { $_.Version -ne $latestRetail.Version -and $_.Version -ne $latestInsider.Version })
+                }
+
+                if ($AppVersion) {
+                    $latestMainPackage = $versionOptions | Where-Object { $_.Version -eq $AppVersion } | Select-Object -First 1
+                    if (-not $latestMainPackage) { throw "Requested app version '$AppVersion' was not found for $mainPackageName on this architecture and Windows version." }
+                    $selectedAppVersion = $AppVersion
+                } elseif ($versionOptions.Count -gt 0) {
+                    $latestMainPackage = $versionOptions[0]
+                    if ($interactiveMode -and $versionOptions.Count -gt 1 -and (-not $NameFilter -or $mainPackageName -like $NameFilter)) {
+                        Write-Host ""
+                        Write-Host "Available versions of $mainPackageName (default is the latest Retail release):" -ForegroundColor Cyan
+                        # When the latest Retail and latest Insider builds are different, work out which one is the newest overall.
+                        #   If the latest Retail build is also in the Insider list, that list's ranks compare the two. Otherwise their version numbers do.
+                        $newestVersion = $null
+                        if ($latestRetail -and $latestInsider -and $latestRetail.Version -ne $latestInsider.Version) {
+                            if ($latestRetail.Ranks.ContainsKey('Insider')) {
+                                $insiderIsNewer = $latestInsider.Ranks['Insider'] -gt $latestRetail.Ranks['Insider']
+                            } else {
+                                $insiderIsNewer = ($latestInsider.Version -as [version]) -gt ($latestRetail.Version -as [version])
+                            }
+                            $newestVersion = if ($insiderIsNewer) { $latestInsider.Version } else { $latestRetail.Version }
+                        }
+
+                        # Line up the columns: the numbers are right-aligned, and the versions are padded to the longest one
+                        $versionWidth = ($versionOptions | ForEach-Object { $_.Version.Length } | Measure-Object -Maximum).Maximum
+                        $lineFormat = "  {0,$("$($versionOptions.Count)".Length)}) {1}  {2}  "
+                        for ($i = 0; $i -lt $versionOptions.Count; $i++) {
+                            $versionOption = $versionOptions[$i]
+                            # A version that's in Retail is shown as Retail even if it's also in the Insider list, so [Insider] means Insider-only
+                            $versionChannels = @($mainPackages | Where-Object { $_.Version -eq $versionOption.Version } | ForEach-Object { $_.Channels } | Select-Object -Unique)
+                            $channelText = if ($versionChannels -contains 'Retail') { '[Retail]' } else { '[Insider]' }
+                            $isLatestRetail = $latestRetail -and $versionOption.Version -eq $latestRetail.Version
+                            $isLatestInsider = $latestInsider -and $versionOption.Version -eq $latestInsider.Version
+                            $labelText = if ($isLatestRetail -and $isLatestInsider) { 'Latest' } elseif ($isLatestRetail) { 'Latest Retail' } elseif ($isLatestInsider) { 'Latest Insider' } else { '' }
+                            if ($labelText -and $versionOption.Version -eq $newestVersion) { $labelText += ' - newest overall' }
+                            $line = $lineFormat -f ($i + 1), $versionOption.Version.PadRight($versionWidth), $channelText.PadRight(9)
+                            if ($labelText) {
+                                Write-Host $line -NoNewline
+                                Write-Host $labelText -ForegroundColor Green
+                            } else {
+                                Write-Host $line.TrimEnd()
+                            }
+                        }
+                        Write-Host ""
+                        while ($true) {
+                            try { $versionChoice = Read-Answer "Select a version (press Enter for 1)" }
+                            catch [System.OperationCanceledException] { $quitAtVersionMenu = $true; $pauseAtEnd = $false; return }
+                            if (-not $versionChoice) { break }
+                            if ($versionChoice -match '^\d+$' -and [int]$versionChoice -ge 1 -and [int]$versionChoice -le $versionOptions.Count) {
+                                $latestMainPackage = $versionOptions[[int]$versionChoice - 1]
+                                break
+                            }
+                            Write-Host "Enter a number from 1 to $($versionOptions.Count), or press Enter for the default." -ForegroundColor Yellow
+                        }
+                        # Only remember a version other than the default, so the command shown at the end still gets the latest version when the default was used
+                        if ($latestMainPackage.Version -ne $versionOptions[0].Version) { $selectedAppVersion = $latestMainPackage.Version }
+                    }
+                }
             }
 
-            # 3. Get the latest version of each dependency
+            # 3. Get the latest version of each dependency, preferring the selected channel's packages.
+            $selectedChannel = if ($latestMainPackage) { $latestMainPackage.Channel } else { 'Retail' }
             $filteredDependencies = @($usablePackages |
-                Where-Object { $_.PackageName -ne $mainPackageName } |
+                Where-Object { $_.PackageName -ne $mainPackageName -and ($_.Channels -contains $selectedChannel -or ($selectedChannel -eq 'Insider' -and $_.Channels -contains 'Retail')) } |
                 Group-Object PackageName, Architecture |
-                ForEach-Object { $_.Group | Sort-Object { $_.Version -as [version] } -Descending | Select-Object -First 1 })
+                ForEach-Object {
+                    $preferredDependencies = @($_.Group | Where-Object { $_.Channels -contains $selectedChannel })
+                    if ($preferredDependencies.Count -eq 0) { $preferredDependencies = @($_.Group) }
+                    $preferredDependencies | Sort-Object { $_.Version -as [version] } -Descending | Select-Object -First 1
+                })
 
             # 4. Combine the lists for the final download queue
             $packagesToDownload = @()
             if ($latestMainPackage) {
                 $packagesToDownload += $latestMainPackage
-                Write-Host "  -> Found latest $mainPackageName package: $($latestMainPackage.FullName)" -ForegroundColor Green
+                Write-Host "  -> Selected $mainPackageName package: $($latestMainPackage.FullName) [$($latestMainPackage.Channel)]" -ForegroundColor Green
             } elseif ($mainPackageName) {
                 if ($architecturePackages | Where-Object { $_.PackageName -eq $mainPackageName }) {
                     Write-Warning "There are $mainPackageName packages, but none of them support this version of Windows ($osVersion)."
@@ -1140,7 +1274,7 @@ try {
                     # Get the download URL for this specific package
                     # The timestamps are generated for each request, because values written directly in the template are fixed when the script starts and expire 5 minutes later
                     $requestTime = (Get-Date).ToUniversalTime()
-                    $fileUrlRequestPayload = $fileUrlXmlTemplate -f $encryptedCookieData, $package.UpdateID, $package.RevisionNumber, $currentBranch, $flightRing, $flightingBranchName, $requestTime.ToString("yyyy-MM-dd'T'HH:mm:ss.fff'Z'"), $requestTime.AddMinutes(5).ToString("yyyy-MM-dd'T'HH:mm:ss.fff'Z'")
+                    $fileUrlRequestPayload = $fileUrlXmlTemplate -f $encryptedCookieData, $package.UpdateID, $package.RevisionNumber, $currentBranch, $package.FlightRing, $package.FlightingBranchName, $requestTime.ToString("yyyy-MM-dd'T'HH:mm:ss.fff'Z'"), $requestTime.AddMinutes(5).ToString("yyyy-MM-dd'T'HH:mm:ss.fff'Z'")
                     $fileUrlResponse = Invoke-WebRequest -Uri "$baseUri/secured" -Method Post -Body $fileUrlRequestPayload -Headers $headers -UseBasicParsing
                     $fileUrlResponseXml = [xml]$fileUrlResponse.Content
 
@@ -1189,6 +1323,7 @@ try {
             Write-Host "An error occurred during the filtering or downloading phase:" -ForegroundColor Red
             Write-Host $_.Exception.ToString()
             $pauseAtEnd = $true
+            if ($selectedAppVersion -or $AppVersion) { return }
         }
     } else {
         $workingDir = $ExistingInstallerFilesPath
@@ -1232,14 +1367,37 @@ try {
         if ($packagesToDownload) {
             $expectedFileNames = $packagesToDownload | ForEach-Object { "$($_.FullName)$([System.IO.Path]::GetExtension($_.FileName))" }
             $expectedFiles = $allDownloadedFiles | Where-Object { $_.Name -in $expectedFileNames }
+            $expectedMainPackage = $packagesToDownload | Where-Object { $mainPackageName -and $_.PackageName -eq $mainPackageName } | Select-Object -First 1
+            $expectedMainFileName = if ($expectedMainPackage) { "$($expectedMainPackage.FullName)$([System.IO.Path]::GetExtension($expectedMainPackage.FileName))" }
             if (@($expectedFiles).Count -eq @($expectedFileNames).Count) {
                 $allDownloadedFiles = $expectedFiles
+            } elseif ($expectedMainFileName -and ($expectedFiles | Where-Object { $_.Name -eq $expectedMainFileName })) {
+                # The chosen app package is there, but some dependencies are missing, for example old frameworks that the server no longer gives download URLs for.
+                # Use the chosen app package along with whatever dependency files are in the folder, but no other version of the app.
+                $allDownloadedFiles = @($allDownloadedFiles | Where-Object { $_.Name -notlike "$($mainPackageName)_*" -or $_.Name -eq $expectedMainFileName })
+            } elseif ($expectedMainFileName -and ($selectedAppVersion -or -not $ForceCachedFilesOnly)) {
+                Write-Warning "The chosen $mainPackageName package is missing from '$workingDir'. Refusing to install a different cached version."
+                $pauseAtEnd = $true
+                return
             }
         }
 
         # Apply -NameFilter to the files too, for when the package list came from the cache folder instead of the server
         if ($NameFilter) {
             $allDownloadedFiles = $allDownloadedFiles | Where-Object { ($_.BaseName -split '_')[0] -like $NameFilter }
+        }
+
+        # With -AppVersion, keep only that version of the app's package, in case the folder has others, such as a cache folder used with -NoCheckLatestVersion
+        #   With -NoCheckLatestVersion the app's package name isn't looked up, so then it's the package that has a file with that version
+        if ($AppVersion) {
+            $appPackageName = if ($mainPackageName) { $mainPackageName } else { $allDownloadedFiles | Where-Object { ($_.BaseName -split '_')[1] -eq $AppVersion } | Select-Object -First 1 | ForEach-Object { ($_.BaseName -split '_')[0] } }
+            $requestedAppFiles = @($allDownloadedFiles | Where-Object { $appPackageName -and ($_.BaseName -split '_')[0] -eq $appPackageName -and ($_.BaseName -split '_')[1] -eq $AppVersion })
+            if ($requestedAppFiles.Count -eq 0) {
+                Write-Warning "Version $AppVersion of the app isn't in '$workingDir'. Refusing to install a different version."
+                $pauseAtEnd = $true
+                return
+            }
+            $allDownloadedFiles = @($allDownloadedFiles | Where-Object { ($_.BaseName -split '_')[0] -ne $appPackageName }) + $requestedAppFiles
         }
 
         # Keep only the highest version of each package (by name and architecture), in case the folder also has older files, such as a cache folder with old and new versions
@@ -1306,6 +1464,26 @@ try {
             $pauseAtEnd = $true
         }
 
+        # 4. Windows Sandbox starts with the region set to 'World' (39070). If it still is, set it to United States, like Install-Microsoft-Store.ps1 does.
+        #    Most Store apps need a license from Microsoft's servers to launch, and the servers won't give one while the region is 'World'.
+        #    Without one, the app shows "There's a problem with <app>. Reinstall the application from its original install location or contact your administrator."
+        #    Apps that declare the 'appLicensing' capability, such as Notepad and Windows Terminal, don't need a license.
+        try {
+            $geoKeyPath = "HKCU:\Control Panel\International\Geo"
+            $currentNation = (Get-ItemProperty -Path $geoKeyPath -Name "Nation" -ErrorAction SilentlyContinue).Nation
+            if (-not $currentNation -or $currentNation -eq "39070") {
+                if (-not (Test-Path $geoKeyPath)) {
+                    New-Item -Path $geoKeyPath -Force -ErrorAction Stop | Out-Null
+                }
+                Set-ItemProperty -Path $geoKeyPath -Name "Nation" -Value "244" -ErrorAction Stop
+                Set-ItemProperty -Path $geoKeyPath -Name "Name" -Value "US" -ErrorAction Stop
+                Write-Host "Changed the Windows region from 'World' to 'United States', because most Store apps can't get the license they need to launch while it's 'World'." -ForegroundColor Gray
+            }
+        } catch {
+            Write-Host "FAILED to change the Windows region from 'World' to 'United States', so the app might not launch until the region is changed in Settings. Error: $($_.Exception.Message)" -ForegroundColor Red
+            $pauseAtEnd = $true
+        }
+
         Write-Host "------------------------------------------------------------"
         Write-Host "Installation process finished." -ForegroundColor Gray
 
@@ -1340,8 +1518,8 @@ try {
         Write-Host "Please update your cache at: $ExistingInstallerFilesPath" -ForegroundColor Yellow
     }
 
-    # After an app was chosen in interactive mode, show the commands that do the same thing without the menus
-    if ($interactiveMode -and ($ProductId -or $CategoryId)) {
+    # After an app was chosen in interactive mode, show the commands that do the same thing without the menus. Not if Q was entered at the version menu, since nothing was done.
+    if ($interactiveMode -and ($ProductId -or $CategoryId) -and -not $quitAtVersionMenu) {
         # The parameters for the commands. A switch has a Value of $null.
         $commandParameters = @()
         if ($ProductId) {
@@ -1358,6 +1536,10 @@ try {
             } else {
                 $commandParameters += [PSCustomObject]@{ Name = $parameter.Key; Value = "$($parameter.Value)" }
             }
+        }
+
+        if ($selectedAppVersion -and -not $AppVersion) {
+            $commandParameters += [PSCustomObject]@{ Name = 'AppVersion'; Value = $selectedAppVersion }
         }
 
         if ($noDownload) {
