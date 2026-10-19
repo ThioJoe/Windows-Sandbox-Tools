@@ -1002,7 +1002,7 @@ The server script downloads the latest stable cloudflared release and packages v
         # Files included for both platforms
         Copy-Item -LiteralPath $clientKey -Destination (Join-Path $clientDirectory 'sandbox-key')
         Copy-Item -LiteralPath $knownHosts -Destination (Join-Path $clientDirectory 'sandbox-known-hosts')
-        Write-Utf8 (Join-Path $clientDirectory 'sandbox-ssh.conf') ($clientConfig.TrimEnd() + "`n")
+        Write-Utf8 (Join-Path $clientDirectory 'sandbox-ssh.conf') ($clientConfig.Replace("`r`n", "`n").TrimEnd() + "`n")
 
         # Platform-specific files
         if ($platform -eq 'LINUX') {
