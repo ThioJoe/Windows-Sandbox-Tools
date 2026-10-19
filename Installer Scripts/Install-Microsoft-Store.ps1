@@ -55,10 +55,14 @@ if ($ForceCachedFilesOnly -and [string]::IsNullOrWhiteSpace($ExistingInstallerFi
 }
 
 # --- Configuration ---
-# Note: These defaults should work for the regular current build of Microsoft Store, but I haven't tested using any of the other values. So fetching insider builds of MS Store (if any) might not work.
+# Note: Tested in October 2026. Leave these at "Retail" and "" (empty) for the normal release of the Microsoft Store.
+#   - FlightRing "External" (not case sensitive) with FlightingBranchName "Dev", "Beta" or "ReleasePreview" gets the Insider builds instead. "Dev" is what the Experimental channel uses (Dev and Canary were merged into Experimental in 2026). The old "CanaryChannel" only still works for a few apps.
+#   - For the server to give download URLs for Insider-only packages, the Step 3 request must contain the same values in an element named deviceAttributes (lowercase d). The server ignores <DeviceAttributes>.
+#   - Other values such as "Internal", "MSIT", "WIF", "WIS" and "RP" are treated the same as Retail for the Store. The old WIF/WIS/RP values (what store.rg-adguard.net's Fast/Slow/RP options use) only still work for a few apps, like WSL.
 $flightRing = "Retail"             # Apparently accepts 'Retail', 'Internal', and 'External'
 $flightingBranchName = ""          # Empty ( "" ) for normal release. Otherwise apparent possible values: Dev, Beta, ReleasePreview, MSIT, CanaryChannel, external
 
+# The server currently ignores CurrentBranch and OSVersion for Store apps (it returns every version for any Windows version), so these are only set to look like a real client.
 $osBuildNumber = [Environment]::OSVersion.Version.Build
 if ($osBuildNumber -ge 26100) {
     $currentBranch = "ge_release"
@@ -69,8 +73,8 @@ if ($osBuildNumber -ge 26100) {
 }
 
 # Random Notes:
-#   flightRing should be "Internal" if flightingBranchName is "MSIT"
-#   MAYBE need flightRing as "External" if setting flightingBranchName anything besides empty or MSIT?
+#   The only parts of the requests that changed the results in testing were FlightRing and FlightingBranchName, DeviceFamily (must be Windows.Desktop), and the InstalledNonLeafUpdateIDs list.
+#   InstalledNonLeafUpdateIDs are checks the device claims to pass (e.g. 11 = AMD64, 23110993 = Windows 10 Plus, 140377312 = OS SKU 48). The server only returns packages whose requirements are in that list.
 
 # ------ Check that we're running in the Windows Sandbox ------
 # This script is intended to be run from within the Windows Sandbox. Warn the user if not. We'll do a rudamentary check for if the current user is named "WDAGUtilityAccount"
@@ -223,7 +227,7 @@ $fileUrlXmlTemplate = @"
         <GetExtendedUpdateInfo2 xmlns="http://www.microsoft.com/SoftwareDistribution/Server/ClientWebService">
             <updateIDs><UpdateIdentity><UpdateID>{1}</UpdateID><RevisionNumber>{2}</RevisionNumber></UpdateIdentity></updateIDs>
             <infoTypes><XmlUpdateFragmentType>FileUrl</XmlUpdateFragmentType></infoTypes>
-            <DeviceAttributes>E:BranchReadinessLevel=CB&amp;CurrentBranch={3}&amp;OEMModel=Virtual%20Machine&amp;FlightRing={4}&amp;AttrDataVer=321&amp;InstallLanguage=en-US&amp;OSUILocale=en-US&amp;InstallationType=Client&amp;FlightingBranchName={5}&amp;OSSkuId=48&amp;App=WU_STORE&amp;ProcessorManufacturer=GenuineIntel&amp;OEMName_Uncleaned=Microsoft%20Corporation&amp;AppVer=1407.2503.28012.0&amp;OSArchitecture=AMD64&amp;IsFlightingEnabled=1&amp;TelemetryLevel=1&amp;DefaultUserRegion=39070&amp;WuClientVer=1310.2503.26012.0&amp;OSVersion=10.0.$osBuildNumber.0&amp;DeviceFamily=Windows.Desktop</DeviceAttributes>
+            <deviceAttributes>E:BranchReadinessLevel=CB&amp;CurrentBranch={3}&amp;OEMModel=Virtual%20Machine&amp;FlightRing={4}&amp;AttrDataVer=321&amp;InstallLanguage=en-US&amp;OSUILocale=en-US&amp;InstallationType=Client&amp;FlightingBranchName={5}&amp;OSSkuId=48&amp;App=WU_STORE&amp;ProcessorManufacturer=GenuineIntel&amp;OEMName_Uncleaned=Microsoft%20Corporation&amp;AppVer=1407.2503.28012.0&amp;OSArchitecture=AMD64&amp;IsFlightingEnabled=1&amp;TelemetryLevel=1&amp;DefaultUserRegion=39070&amp;WuClientVer=1310.2503.26012.0&amp;OSVersion=10.0.$osBuildNumber.0&amp;DeviceFamily=Windows.Desktop</deviceAttributes>
         </GetExtendedUpdateInfo2>
     </s:Body>
 </s:Envelope>
