@@ -4,7 +4,7 @@
 
 # Author: ThioJoe
 # Repo Url: https://github.com/ThioJoe/Windows-Sandbox-Tools
-# Last Updated: October 19, 2026
+# Last Updated: November 17, 2026
 
 param(
     # Optional switch to output the generated XML files to the working directory
@@ -588,7 +588,26 @@ try {
             Write-Host "Installing the main application..."
             Write-Host "  -> Installing $($storePackageFile.Name)"
             try {
-                Add-AppxPackage -Path $storePackageFile.FullName -ErrorAction Stop
+                try {
+                    Add-AppxPackage -Path $storePackageFile.FullName -ErrorAction Stop
+                } catch {
+                    # On newer Windows 10 builds (such as 19045.7807), the Sandbox lists the host's app packages as staged, but their folders are empty.
+                    #   Installing the Store then fails with 0x80073CF0 ("Opening file from location: AppxManifest.xml failed"), because Windows tries to read the manifest of one of those packages.
+                    #   Removing the staged packages whose files are missing, then trying again, fixes it. This is only done in the Sandbox, which is thrown away when it's closed.
+                    if ($env:USERNAME -ne "WDAGUtilityAccount" -or $_.Exception.Message -notmatch '0x80073CF0') { throw }
+                    $brokenPackages = @(Get-AppxPackage -AllUsers | Where-Object {
+                        $_.InstallLocation -and -not (Test-Path (Join-Path $_.InstallLocation 'AppxManifest.xml')) -and
+                        -not ($_.PackageUserInformation | Where-Object { $_.InstallState -eq 'Installed' })
+                    })
+                    Write-Host "     The first attempt failed. Removing $($brokenPackages.Count) leftover app package(s) whose files are missing in the Sandbox, then trying again." -ForegroundColor Yellow
+                    Write-Host "     This can take several minutes..." -ForegroundColor Yellow
+                    foreach ($brokenPackage in $brokenPackages) {
+                        try { Remove-AppxPackage -Package $brokenPackage.PackageFullName -AllUsers -ErrorAction Stop }
+                        catch { Write-Host "     Could not remove $($brokenPackage.PackageFullName): $($_.Exception.Message)" -ForegroundColor DarkYellow }
+                    }
+                    Write-Host "     Installing the Store again..."
+                    Add-AppxPackage -Path $storePackageFile.FullName -ErrorAction Stop
+                }
                 Write-Host "     SUCCESS: Microsoft Store has been installed/updated." -ForegroundColor Green
             } catch {
                 Write-Host "     FAILED to install $($storePackageFile.Name). Error: $($_.Exception.Message)" -ForegroundColor Red
