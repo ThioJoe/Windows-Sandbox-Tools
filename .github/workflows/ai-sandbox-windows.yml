@@ -1,0 +1,477 @@
+# .github/workflows/ai-sandbox-windows.yml
+name: Temporary Testing Sandbox
+
+on:
+  workflow_dispatch:
+    inputs:
+      ssh_public_key:
+        description: 'The SSH public key to authorize for the connection'
+        required: true
+        type: string
+      duration_minutes:
+        description: 'How long to keep the sandbox alive'
+        required: false
+        default: '60'
+        type: string
+      runner_image:
+        description: 'Which GitHub-hosted runner image to provision'
+        required: false
+        default: 'windows-latest'
+        # A fixed list rather than free text: this value becomes runs-on, and an arbitrary label could select a self-hosted or larger (billed) runner.
+        type: choice
+        options:
+          - windows-latest
+          - windows-2025
+          - windows-2022
+          - windows-11-arm
+
+# The sandbox job needs no repository access at all.
+# Handing it an empty permission set means the GITHUB_TOKEN present in the runner environment cannot act on the repo, which matters because anyone who reaches the SSH session can read that environment.
+permissions: {}
+
+jobs:
+  sandbox:
+    runs-on: ${{ inputs.runner_image }}
+    timeout-minutes: 360
+    steps:
+      - name: Provision Secure SSH Tunnel
+        env:
+          ACTION_SSH_PUBLIC_KEY: ${{ inputs.ssh_public_key }}
+          ACTION_DURATION_MINUTES: ${{ inputs.duration_minutes }}
+          # Whether the signing secret exists, not the secret itself.
+          # This step downloads and runs two binaries from the network, so the owner's long-lived key is deliberately kept out of its environment and appears only in the dedicated signing step below.
+          # Checking presence here still fails the run before a sandbox is provisioned rather than after.
+          ACTION_HAS_SIGNER: ${{ secrets.ACTION_SIGNER_PRIVATE != '' }}
+        run: |
+          $ProgressPreference = 'SilentlyContinue'
+          $ErrorActionPreference = 'Stop'
+
+          # Fail before anything is provisioned rather than after a runner has been held for minutes.
+          # The signing step enforces this again with the actual key; this is only to fail early and cheaply.
+          if ($env:ACTION_HAS_SIGNER -ne 'true') {
+              Write-Error "ACTION_SIGNER_PRIVATE is not set; refusing to provision a sandbox that cannot be attested."
+              exit 1
+          }
+
+          # ---------------------------------------------------------------
+          # 1. Make sure the OpenSSH server is running.
+          # ---------------------------------------------------------------
+          if (-not (Get-Service sshd -ErrorAction SilentlyContinue)) {
+              # Images without the server built in (the Windows 11 ARM64 one) would have to pull the OpenSSH.Server capability from Windows Update, and Add-WindowsCapability stalled doing that on a hosted runner.
+              # Install Microsoft's standalone Win32-OpenSSH build instead, pinned by version and checked against a known digest for the same reason as age below.
+              $SshVer = '10.0.0.0p2-Preview'
+              # The machine-level value, not the process one: it still reads ARM64 if this shell is itself running emulated.
+              if ([Environment]::GetEnvironmentVariable('PROCESSOR_ARCHITECTURE', 'Machine') -eq 'ARM64') {
+                  $SshArch = 'ARM64'
+                  $SshSha  = '698c6aec31c1dd0fb996206e8741f4531a97355686b5431ef347d531b07fcd42'
+              } else {
+                  $SshArch = 'Win64'
+                  $SshSha  = '23f50f3458c4c5d0b12217c6a5ddfde0137210a30fa870e98b29827f7b43aba5'
+              }
+              Write-Host "Installing OpenSSH Server $SshVer ($SshArch)..."
+              $SshZip = Join-Path $env:TEMP 'openssh.zip'
+              Invoke-WebRequest -Uri "https://github.com/PowerShell/Win32-OpenSSH/releases/download/$SshVer/OpenSSH-$SshArch.zip" -OutFile $SshZip
+              $SshGot = (Get-FileHash $SshZip -Algorithm SHA256).Hash.ToLower()
+              if ($SshGot -ne $SshSha) {
+                  Write-Error "OpenSSH download digest mismatch: expected $SshSha, got $SshGot"
+                  exit 1
+              }
+              # Under Program Files, so only administrators can write to the binaries the service runs.
+              Expand-Archive -Path $SshZip -DestinationPath $env:ProgramFiles -Force
+              $SshInstall = Join-Path $env:ProgramFiles "OpenSSH-$SshArch\install-sshd.ps1"
+              if (-not (Test-Path $SshInstall)) { Write-Error "install-sshd.ps1 not found after extraction."; exit 1 }
+              # Registers the sshd service without starting it. The service creates its config and host keys on first start, which the lines below rely on.
+              & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $SshInstall
+              if ($LASTEXITCODE -ne 0 -or -not (Get-Service sshd -ErrorAction SilentlyContinue)) {
+                  Write-Error "OpenSSH Server install failed (install-sshd.ps1 exit code $LASTEXITCODE)."
+                  exit 1
+              }
+          }
+          Set-Service -Name sshd -StartupType Automatic
+          Start-Service sshd
+
+          # Use PowerShell (not cmd) for incoming SSH sessions.
+          New-ItemProperty -Path "HKLM:\SOFTWARE\OpenSSH" `
+              -Name DefaultShell `
+              -Value "C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe" `
+              -PropertyType String -Force | Out-Null
+
+          # ---------------------------------------------------------------
+          # 2. Rewrite sshd_config.
+          #
+          # The stock Windows config ends with a `Match Group administrators` block that redirects admin keys to administrators_authorized_keys.
+          # Anything appended after it would land *inside* that block, so drop the block entirely and then set our global directives.
+          # ---------------------------------------------------------------
+          $SshdConfig = "C:\ProgramData\ssh\sshd_config"
+          $Lines = @(Get-Content $SshdConfig)
+          $Match = $Lines | Select-String -Pattern '^\s*Match\s+Group\s+administrators' |
+                   Select-Object -First 1
+          if ($Match) {
+              $Keep = $Match.LineNumber - 1
+              if ($Keep -gt 0) { $Lines = $Lines[0..($Keep - 1)] } else { $Lines = @() }
+          }
+          $Lines += @(
+              '',
+              '# --- injected by ai-sandbox-windows.yml ---',
+              'PubkeyAuthentication yes',
+              'PasswordAuthentication no',
+              'AuthorizedKeysFile .ssh/authorized_keys',
+              'StrictModes no',
+              'AllowTcpForwarding yes',
+              'GatewayPorts no',
+              'ClientAliveInterval 30'
+          )
+          Set-Content -Path $SshdConfig -Value $Lines -Encoding ascii
+
+          # ---------------------------------------------------------------
+          # 3. Authorize the caller's public key.
+          # ---------------------------------------------------------------
+          # authorized_keys is not just a list of keys -- each line may carry an options prefix (command=, permitopen=, ...) and the file may hold many lines.
+          # Writing the raw input would let a malformed or hostile value authorize more than the one key it appears to.
+          # Accept exactly one well-formed key line and nothing else.
+          #
+          # ECDSA is deliberately not accepted, though sshd would take it happily.
+          # The same key is the age recipient for everything this run publishes, and age supports only ssh-ed25519 and ssh-rsa -- an ECDSA key would authorise fine, provision a whole sandbox, and then fail at the encryption step with the runner already burning quota.
+          # Refuse it here instead, where the message can say why.
+          $KeyIn = $env:ACTION_SSH_PUBLIC_KEY.Trim()
+          if ($KeyIn -notmatch '^(ssh-ed25519|ssh-rsa) [A-Za-z0-9+/]+={0,2}( [^\r\n]*)?$') {
+              Write-Error "ssh_public_key must be a single well-formed ssh-ed25519 or ssh-rsa public key line. ECDSA is not usable here: age cannot encrypt to it."
+              exit 1
+          }
+
+          $SshDir = Join-Path $env:USERPROFILE ".ssh"
+          New-Item -ItemType Directory -Path $SshDir -Force | Out-Null
+          $KeyIn | Out-File -Encoding ascii -FilePath (Join-Path $SshDir "authorized_keys")
+
+          Restart-Service sshd
+          Write-Host "sshd restarted; key authorized for $env:USERNAME"
+
+          # ---------------------------------------------------------------
+          # 3b. Capture this machine's SSH host key so the caller can pin it.
+          #
+          # Without this the client has nothing to verify the server against and has to blindly accept whatever answers on the tunnel hostname. sshd generates its host keys on first start, so they exist by now.
+          # ---------------------------------------------------------------
+          $HostKeyFile = "C:\ProgramData\ssh\ssh_host_ed25519_key.pub"
+          if (-not (Test-Path $HostKeyFile)) {
+              Write-Error "Host key $HostKeyFile not found; cannot publish a pin."
+              exit 1
+          }
+          # "ssh-ed25519 <base64> <comment>" -> the base64 blob only.
+          $HostKeyB64 = ((Get-Content $HostKeyFile -Raw).Trim() -split '\s+')[1]
+
+          # ---------------------------------------------------------------
+          # 3c. Fetch age, and record the caller as the encryption recipient.
+          #
+          # The caller already hands us an ssh-ed25519 public key to authorise for SSH; age can encrypt to that same key, so anything this run publishes can be made readable only by whoever holds the matching per-run private key.
+          # No extra key material and nothing to configure.
+          #
+          # Pinned by version and checked against a known digest: this runs before the sandbox is reachable, and a swapped binary here would see everything the run encrypts.
+          # ---------------------------------------------------------------
+          $AgeVer = 'v1.2.1'
+          $AgeSha = '46db0db71f146061f7c8fffa912cb806aef1bc8450e27a3abc1744f0591b89fb'
+          $AgeZip = Join-Path $env:TEMP 'age.zip'
+          Invoke-WebRequest -Uri "https://github.com/FiloSottile/age/releases/download/$AgeVer/age-$AgeVer-windows-amd64.zip" -OutFile $AgeZip
+          $Got = (Get-FileHash $AgeZip -Algorithm SHA256).Hash.ToLower()
+          if ($Got -ne $AgeSha) {
+              Write-Error "age download digest mismatch: expected $AgeSha, got $Got"
+              exit 1
+          }
+          Expand-Archive -Path $AgeZip -DestinationPath (Join-Path $env:TEMP 'agedist') -Force
+          $AgeExe = Join-Path $env:TEMP 'agedist\age\age.exe'
+          if (-not (Test-Path $AgeExe)) { Write-Error "age.exe not found after extraction."; exit 1 }
+
+          $Recipient = Join-Path $env:TEMP 'recipient.pub'
+          [IO.File]::WriteAllText($Recipient, $KeyIn + "`n")
+          Write-Host "age $AgeVer ready; encrypting to the caller's per-run key"
+
+          # ---------------------------------------------------------------
+          # 4. Start the Cloudflare Tunnel.
+          # ---------------------------------------------------------------
+          # Pinned to a release tag rather than tracking /releases/latest/.
+          # This binary runs with administrator rights for the whole life of the sandbox, alongside the build outputs and a step that handles the owner's signing key, so what it is should be a decision, not whatever shipped that morning.
+          #
+          # A tag is Cloudflare's to move, so this is trust in the source rather than proof of the bytes -- it stops a new release being adopted unreviewed, which is the realistic risk.
+          # $CfVer is the single source of truth for both sides: Build-PortableSetup.ps1 reads it and keeps setup.sh matching.
+          $CfVer = '2026.11.0'
+          if ($CfVer -eq 'PENDING') {
+              Write-Error "cloudflared is not pinned. Run Build-PortableSetup.ps1 to record a version, then commit this file."
+              exit 1
+          }
+
+          $Url = "https://github.com/cloudflare/cloudflared/releases/download/$CfVer/cloudflared-windows-amd64.exe"
+          $CfExe = Join-Path $PWD "cloudflared.exe"
+          Invoke-WebRequest -Uri $Url -OutFile $CfExe
+
+          # The tunnel has to outlive this step, because the step that holds the runner open is a *different* step.
+          # A child of this shell does not survive that boundary (and redirected stdio handles close with the parent), so spawn it through WMI: the new process is parented by the WMI service and keeps running.
+          # It writes its own logfile rather than inheriting our pipes, for the same reason.
+          $CfLog = Join-Path $env:USERPROFILE "cloudflared.log"
+          Remove-Item $CfLog -ErrorAction SilentlyContinue
+
+          $Spawn = Invoke-CimMethod -ClassName Win32_Process -MethodName Create -Arguments @{
+              CommandLine = "`"$CfExe`" tunnel --url tcp://localhost:22 --logfile `"$CfLog`" --loglevel info"
+          }
+          if ($Spawn.ReturnValue -ne 0) {
+              Write-Error "Failed to spawn cloudflared (WMI rc=$($Spawn.ReturnValue))."; exit 1
+          }
+          $CfPid = $Spawn.ProcessId
+          Write-Host "cloudflared started detached as PID $CfPid"
+
+          # Poll the logfile for the hostname Cloudflare assigns.
+          $CfHost = $null
+          for ($i = 0; $i -lt 45; $i++) {
+              Start-Sleep -Seconds 1
+              if (Test-Path $CfLog) {
+                  $LogContent = Get-Content $CfLog -Raw -ErrorAction SilentlyContinue
+                  if ($LogContent -match "https://([a-zA-Z0-9-]+\.trycloudflare\.com)") {
+                      $CfHost = $Matches[1]
+                      break
+                  }
+              }
+              if (-not (Get-Process -Id $CfPid -ErrorAction SilentlyContinue)) {
+                  Write-Host "cloudflared exited early:"
+                  if (Test-Path $CfLog) { Get-Content $CfLog }
+                  break
+              }
+          }
+
+          if (-not $CfHost) { Write-Error "Failed to establish Cloudflare tunnel."; exit 1 }
+
+          # Register the hostname as a secret so the runner redacts it from every subsequent log line, in this step and every later one.
+          # Without this the encryption of the connection artifact is pointless on a public repository: the logs API is closed while the run is live, but the web UI streams the log to anyone watching, so the hostname would be readable exactly while it is still useful.
+          #
+          # This cannot happen any earlier -- the hostname does not exist until Cloudflare assigns it.
+          # The early-exit dump in the loop above is therefore unmasked, which is acceptable: it only runs when cloudflared has already died, and a hostname whose tunnel is gone routes nowhere.
+          Write-Host "::add-mask::$CfHost"
+
+          # The hostname is assigned before the Cloudflare edge actually routes it; connecting too early fails with "websocket: bad handshake".
+          # Wait for the tunnel to register before advertising it.
+          for ($i = 0; $i -lt 30; $i++) {
+              if ((Get-Content $CfLog -Raw -ErrorAction SilentlyContinue) -match "Registered tunnel connection") { break }
+              Start-Sleep -Seconds 1
+          }
+
+          # ---------------------------------------------------------------
+          # 5. Publish the connection string.
+          #
+          # The logs API and the step summary both 404 / return empty until the job *finishes*, which is useless for a sandbox that is only interesting while it is still running.
+          # Artifacts, by contrast, are queryable as soon as they finish uploading, so the next step publishes the hostname that way.
+          #
+          # The log is not a fallback channel for it.
+          # The hostname is masked above, so this marker exists only to show how far the job got -- the caller reads the artifact or nothing.
+          # ---------------------------------------------------------------
+          Write-Host "=== SSH_CONNECTION_READY ==="
+          Write-Host "tunnel up; details published encrypted in the sandbox-connection artifact"
+
+          # ---------------------------------------------------------------
+          # 5a. Write the details to be attested.
+          #
+          # Everything goes in one artifact's *contents*: the known_hosts line, the signature over it, and the public half of the key that signed.
+          # Writing the exact known_hosts line and signing that binds the hostname and the host key together, so neither can be swapped independently.
+          #
+          # Only the plaintext is produced here. Signing and encryption happen in the next step, which is the only one the owner's key is exposed to.
+          # ---------------------------------------------------------------
+          $PubDir = Join-Path $PWD "sandbox-connection"
+          New-Item -ItemType Directory -Path $PubDir -Force | Out-Null
+          [IO.File]::WriteAllText((Join-Path $PubDir "connection.txt"), "$CfHost ssh-ed25519 $HostKeyB64")
+          "SANDBOX_PUBDIR=$PubDir" | Out-File $env:GITHUB_ENV -Append -Encoding utf8
+
+          # Anything dropped here during the session is encrypted and uploaded once the sandbox stops, giving the session a way to hand data back that only the caller can read.
+          $Outbox = 'C:\sandbox-outbox'
+          $OutboxStage = 'C:\sandbox-outbox-encrypted'
+          New-Item -ItemType Directory -Path $Outbox -Force | Out-Null
+          Write-Host "outbox ready: put files in $Outbox to have them published encrypted"
+
+          "AGE_EXE=$AgeExe"       | Out-File $env:GITHUB_ENV -Append -Encoding utf8
+          "AGE_RECIPIENT=$Recipient" | Out-File $env:GITHUB_ENV -Append -Encoding utf8
+          "SANDBOX_OUTBOX=$Outbox"   | Out-File $env:GITHUB_ENV -Append -Encoding utf8
+          "SANDBOX_OUTBOX_STAGE=$OutboxStage" | Out-File $env:GITHUB_ENV -Append -Encoding utf8
+
+          "CF_HOST=$CfHost" | Out-File $env:GITHUB_ENV -Append -Encoding utf8
+          "CF_PID=$CfPid"   | Out-File $env:GITHUB_ENV -Append -Encoding utf8
+
+      # -------------------------------------------------------------------
+      # The only step the owner's long-lived key is exposed to.
+      #
+      # It is deliberately the narrowest step in the job: it downloads nothing, spawns nothing, and touches only binaries already on the runner or fetched under a pinned digest.
+      # The provisioning step above pulls cloudflared from a mutable URL and executes it, which is exactly the company the trust anchor should not keep.
+      #
+      # This does not make the key safe from a compromised runner -- anything with administrator rights on this box can read another process's environment, and cloudflared is still running by now.
+      # It removes the easy paths, not the hard one. See README, "If this repository is public".
+      #
+      # Fail closed. Publishing unsigned details would silently reduce this to trusting whatever answers on the hostname, so the upload below runs only if this step succeeds.
+      # -------------------------------------------------------------------
+      - name: Sign and encrypt connection details
+        env:
+          # Held by the repository owner.
+          # Whatever drives this workflow does not know it, which is the point: it cannot forge the attestation, and the client refuses to connect without a valid one.
+          ACTION_SIGNER_PRIVATE: ${{ secrets.ACTION_SIGNER_PRIVATE }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+
+          if (-not $env:ACTION_SIGNER_PRIVATE) {
+              Write-Error "ACTION_SIGNER_PRIVATE is not set; refusing to publish unsigned connection details."
+              exit 1
+          }
+
+          $PubDir = $env:SANDBOX_PUBDIR
+          $PayloadFile = Join-Path $PubDir "connection.txt"
+          if (-not (Test-Path $PayloadFile)) { Write-Error "nothing to sign at $PayloadFile"; exit 1 }
+
+          # The key exists on disk only for the duration of the signing call.
+          $SignKey = Join-Path $env:TEMP "sandbox_signing_key"
+          [IO.File]::WriteAllText($SignKey, $env:ACTION_SIGNER_PRIVATE.Trim() + "`n")
+          icacls $SignKey /inheritance:r /grant:r "$($env:USERNAME):(R)" | Out-Null
+
+          try {
+              # The public half is derived and published so the caller never has to be told it out of band.
+              # On its own that proves nothing -- anything able to forge the signature could publish a matching key -- so the caller pins it on first use and treats a later change as a failure until a human confirms the rotation.
+              (& ssh-keygen -y -f $SignKey) -join '' |
+                  Out-File (Join-Path $PubDir "signer.pub") -Encoding ascii -NoNewline
+              if ($LASTEXITCODE -ne 0) { throw "could not derive the signing public key ($LASTEXITCODE)" }
+
+              & ssh-keygen -Y sign -f $SignKey -n sandbox-host -q $PayloadFile
+              if ($LASTEXITCODE -ne 0) { throw "ssh-keygen -Y sign failed ($LASTEXITCODE)" }
+          } finally {
+              Remove-Item $SignKey -Force -ErrorAction SilentlyContinue
+          }
+
+          if (-not (Test-Path "$PayloadFile.sig")) { Write-Error "no signature produced."; exit 1 }
+
+          # Sign first, then encrypt the result to the caller.
+          # The signature still proves who published this; encryption only controls who can read it.
+          foreach ($f in @('connection.txt', 'connection.txt.sig', 'signer.pub')) {
+              $Plain = Join-Path $PubDir $f
+              & $env:AGE_EXE -R $env:AGE_RECIPIENT -o "$Plain.age" $Plain
+              if ($LASTEXITCODE -ne 0) { Write-Error "age failed encrypting $f"; exit 1 }
+              Remove-Item $Plain -Force
+          }
+          Write-Host "published (encrypted): $(Get-ChildItem $PubDir | ForEach-Object Name)"
+
+      # -------------------------------------------------------------------
+      # One artifact, carrying its contents rather than encoding anything in its name.
+      # upload-artifact authenticates with ACTIONS_RUNTIME_TOKEN rather than GITHUB_TOKEN, so this still works under `permissions: {}`.
+      #
+      # Actions are pinned to a commit SHA rather than a tag: a tag is mutable, and this one runs in the same job as the sandbox.
+      # -------------------------------------------------------------------
+      - name: Publish connection details
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: sandbox-connection
+          path: sandbox-connection/
+          retention-days: 1
+
+      - name: Hold sandbox open
+        env:
+          ACTION_DURATION_MINUTES: ${{ inputs.duration_minutes }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+
+          # ---------------------------------------------------------------
+          # 6. Hold the runner open.
+          #
+          # Report liveness periodically so a log read after the fact shows how long the sandbox actually stood up.
+          # It deliberately does not re-print the connection string: the hostname is masked, so that would emit `***` once a minute and tell nobody anything.
+          # Exit early if the SSH session drops a stop file, so the job does not burn quota once work ends.
+          #
+          # The session can also move the deadline out, by writing a number of minutes to the extend file.
+          # Same channel as the stop file, in the other direction: the loop already wakes every 15 seconds, so it costs nothing to look.
+          # That means a duration can be chosen tight, which is the cheap default, without the choice being final -- the alternative is over-requesting up front to avoid losing work, which wastes far more.
+          # ---------------------------------------------------------------
+          $StopFile   = Join-Path $env:USERPROFILE "stop-sandbox"
+          $ExtendFile = Join-Path $env:USERPROFILE "extend-sandbox"
+          Write-Host "Sandbox is up; connect using the sandbox-connection artifact."
+          Write-Host "Create $StopFile to shut the sandbox down early."
+          Write-Host "Write a number of minutes to $ExtendFile to postpone the deadline."
+
+          $Minutes = 60
+          [int]::TryParse("$env:ACTION_DURATION_MINUTES".Trim(), [ref]$Minutes) | Out-Null
+          if ($Minutes -le 0) { $Minutes = 60 }
+          $Deadline = (Get-Date).AddMinutes($Minutes)
+
+          # No extension can outlive the job's own timeout-minutes, so the loop keeps its own ceiling a little inside it.
+          # Exiting cleanly here means the outbox is encrypted and published normally, rather than the runner being killed mid-step and leaving that to the always() handlers.
+          $HardCeiling = (Get-Date).AddMinutes(350)
+          Write-Host "Sandbox will self-terminate at $Deadline (UTC offset local)."
+
+          while ((Get-Date) -lt $Deadline) {
+              if (Test-Path $StopFile) {
+                  Write-Host "Stop file detected - shutting down."
+                  break
+              }
+
+              if (Test-Path $ExtendFile) {
+                  # Read and delete before parsing, so a malformed value is consumed once rather than re-reported every 15 seconds.
+                  $Raw = Get-Content $ExtendFile -Raw -ErrorAction SilentlyContinue
+                  Remove-Item $ExtendFile -Force -ErrorAction SilentlyContinue
+                  $Add = 0
+                  if ([int]::TryParse("$Raw".Trim(), [ref]$Add) -and $Add -gt 0) {
+                      $Deadline = $Deadline.AddMinutes($Add)
+                      if ($Deadline -gt $HardCeiling) {
+                          $Deadline = $HardCeiling
+                          Write-Host "extension clamped to the job timeout"
+                      }
+                      Write-Host "extended by $Add min; now self-terminating at $Deadline"
+                  } else {
+                      # A partially written file reads as garbage; saying so is better than silently dropping the request, since the caller can simply write it again.
+                      Write-Host "ignored an unreadable extension request"
+                  }
+              }
+
+              if (-not (Get-Process -Id ([int]$env:CF_PID) -ErrorAction SilentlyContinue)) {
+                  Write-Host "Cloudflare tunnel died - shutting down."
+                  break
+              }
+              Start-Sleep -Seconds 15
+              if ((Get-Date).Second -lt 15) {
+                  Write-Host "[heartbeat] $([int]($Deadline - (Get-Date)).TotalMinutes) min remaining"
+              }
+          }
+          Write-Host "Sandbox finished."
+
+      # Anything the session left in the outbox is encrypted to the caller and published once the sandbox stops.
+      # Artifacts outlive the run, so this is how the sandbox hands back data that only the caller can read.
+      - name: Encrypt outbox
+        id: encrypt-outbox
+        if: always()
+        run: |
+          $ErrorActionPreference = 'Stop'
+
+          # Ciphertext is written to a staging directory and the upload publishes only that, never the directory the session wrote into.
+          # Uploading the source directory would fail open: age failing partway through leaves the files it had not reached sitting there in plaintext, and a file the session added after the listing was taken would never be encrypted at all.
+          # Nothing reaches the staging directory except age's output, so there is no sequence of failures that puts plaintext in the artifact.
+          $Outbox = $env:SANDBOX_OUTBOX
+          $Stage  = $env:SANDBOX_OUTBOX_STAGE
+          if (-not $Outbox -or -not (Test-Path $Outbox)) { Write-Host "no outbox to publish"; exit 0 }
+          $Files = @(Get-ChildItem $Outbox -File -Recurse)
+          if ($Files.Count -eq 0) { Write-Host "outbox empty"; exit 0 }
+
+          New-Item -ItemType Directory -Path $Stage -Force | Out-Null
+          foreach ($f in $Files) {
+              # Keep the session's own layout, so nested files cannot collide on basename.
+              $Rel  = $f.FullName.Substring($Outbox.Length).TrimStart('\')
+              $Dest = Join-Path $Stage "$Rel.age"
+              New-Item -ItemType Directory -Path (Split-Path $Dest -Parent) -Force | Out-Null
+              & $env:AGE_EXE -R $env:AGE_RECIPIENT -o $Dest $f.FullName
+              if ($LASTEXITCODE -ne 0) { Write-Error "age failed encrypting $Rel"; exit 1 }
+          }
+
+          # The upload is gated on this step succeeding, so this assertion is what that gate is worth.
+          $Leaked = @(Get-ChildItem $Stage -File -Recurse | Where-Object { $_.Extension -ne '.age' })
+          if ($Leaked.Count -gt 0) {
+              Write-Error "staging directory holds $($Leaked.Count) file(s) that are not ciphertext; refusing to publish."
+              exit 1
+          }
+          Write-Host "encrypted $($Files.Count) outbox file(s) to the caller's key"
+
+      # Gated on the encryption step, not merely on the job reaching this point.
+      # always() alone would publish after a failed encryption, which is the one case where the directory may hold something readable.
+      # The outcome check still allows a cancelled or timed-out run to publish, since the step above runs under always() too.
+      - name: Publish outbox
+        if: always() && steps.encrypt-outbox.outcome == 'success'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: sandbox-outbox
+          path: C:\sandbox-outbox-encrypted
+          if-no-files-found: ignore
+          retention-days: 1
